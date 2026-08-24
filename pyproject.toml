@@ -1,0 +1,12 @@
+[project]
+name = "comfyui-h3-prompt-maker"
+description = "MiniMax H3 prompt architect & remake nodes for ComfyUI (local LLM / CLI backends)"
+version = "1.0.0"
+license = { file = "LICENSE" }
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/ssain3d-lgtm/Comfyui-H3-Prompt-Maker-lgtm-"
+
+[tool.comfy]
+DisplayName = "MiniMax H3 Prompt Maker"
