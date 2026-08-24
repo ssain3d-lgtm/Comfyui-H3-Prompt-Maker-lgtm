@@ -43,35 +43,45 @@ SFW/NSFW · 참조 이미지(IMAGE, 최대 9장 — `<Picture N>` 라벨 자동 
 
 ## LLM 백엔드
 
-`backend` 위젯으로 선택합니다.
+`backend` 드롭다운에서 고르면 표준 주소/명령이 자동으로 적용됩니다
+(ComfyUI-LLM-Hub와 같은 방식). 대부분의 경우 **백엔드만 고르고 `server_model`
+드롭다운에서 모델을 선택**하면 끝입니다.
 
-### `openai_compatible` — OpenAI 호환 HTTP 서버 (권장)
+### 로컬 HTTP 서버 (프리셋 — base_url 입력 불필요)
 
-`base_url` + `model` (+ 필요시 `api_key`)만 맞추면 됩니다:
-
-| 러너 | base_url | 비고 |
+| backend | 자동 주소 | 비고 |
 |---|---|---|
-| LM Studio | `http://localhost:1234/v1` | model은 로드된 모델명 (대충 넣어도 동작) |
-| llama.cpp (`llama-server`) | `http://localhost:8080/v1` | `llama-cli` 단발 실행은 매번 모델을 리로드하므로 비추천 |
-| Ollama | `http://localhost:11434/v1` | model에 정확한 모델명 필요 (예: `qwen3:14b`) |
-| vLLM / KoboldCpp 등 | 각 서버 주소 | OpenAI 호환이면 전부 동작 |
-| OpenRouter | `https://openrouter.ai/api/v1` | api_key 필요 |
-| Gemini (OpenAI 호환) | `https://generativelanguage.googleapis.com/v1beta/openai` | api_key 필요 — 웹앱과 동일 품질 |
+| `lmstudio` | `http://127.0.0.1:1234/v1` | 기본값. 서버 켜고 브라우저 새로고침하면 `server_model`에 모델 목록이 뜸 |
+| `ollama` | `http://127.0.0.1:11434/v1` | |
+| `llamacpp` | `http://127.0.0.1:8080/v1` | `llama-server` 기준. `llama-cli` 단발 실행은 매번 모델을 리로드하므로 비추천 |
+| `vllm` | `http://127.0.0.1:8000/v1` | |
 
+- **`server_model` 드롭다운**: 위 표준 포트에 떠 있는 서버들의 모델 목록을 자동 조회합니다
+  (내 컴퓨터 loopback만 조회 — 원격/유료 주소는 건드리지 않음). `(auto)` = `model` 칸의 값 사용.
+  서버를 켠 뒤 브라우저를 새로고침하면 목록이 갱신됩니다.
 - 참조 이미지는 **비전 모델**(Qwen-VL, Gemma 3 비전 등)을 로드했을 때만 LLM이 직접 봅니다.
   비전 미지원 모델이면 자동으로 텍스트 전용으로 재시도합니다 (`send_images_to_llm` 끄기 가능).
 - 권장 로컬 모델: **Qwen3 14B 이상 인스트럭트** — 형식 준수가 빡빡해서 8B 이하는 자주 깨집니다.
 
-### `cli` — CLI 모델 러너
+### `openai_compat` — 그 외 OpenAI 호환 주소 (base_url 직접 입력)
 
-`cli_command`의 명령을 실행하고 전체 프롬프트를 stdin으로 넘긴 뒤 stdout을 결과로 사용합니다:
-
-| 러너 | cli_command | 비고 |
+| 대상 | base_url | 비고 |
 |---|---|---|
-| Claude Code | `claude -p --output-format text` | API 키 없이 구독으로 처리 |
-| Gemini CLI | `gemini -p` | 구글 계정/구독으로 처리 |
-| Codex CLI | `codex exec` | |
-| 기타 | 원하는 명령 자유 입력 | stdin→stdout 규약만 지키면 됨 |
+| OpenRouter | `https://openrouter.ai/api/v1` | api_key 필요 |
+| Gemini (OpenAI 호환) | `https://generativelanguage.googleapis.com/v1beta/openai` | api_key 필요 — 웹앱과 동일 품질 |
+| OpenAI / KoboldCpp / 원격 서버 | 각 주소 | OpenAI 호환이면 전부 동작 |
+
+### CLI 백엔드 (구독 CLI 모델)
+
+전체 프롬프트를 stdin으로 넘기고 stdout을 결과로 사용합니다. `cli_command`를
+비우면 프리셋 명령이 쓰입니다:
+
+| backend | 기본 명령 | 비고 |
+|---|---|---|
+| `claude_cli` | `claude -p --output-format text` | API 키 없이 구독으로 처리 |
+| `gemini_cli` | `gemini -p` | 구글 계정/구독으로 처리 |
+| `codex_cli` | `codex exec` | |
+| `custom_cli` | (직접 입력 필수) | stdin→stdout 규약만 지키면 어떤 CLI든 가능 |
 
 CLI 방식은 프로세스 기동 오버헤드 때문에 HTTP 서버 방식보다 호출당 수 초 느리고,
 이미지 전달은 지원하지 않습니다(텍스트 전용).

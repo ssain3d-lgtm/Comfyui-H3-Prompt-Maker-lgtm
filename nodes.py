@@ -11,12 +11,11 @@ import io
 import re
 
 from .h3_prompts import build_system_prompt, nearest_grid_frames
-from .llm_backends import call_llm
+from .llm_backends import call_llm, AUTO_MODEL, BACKEND_NAMES, discover_local_models
 
 SUBMODES = ["ref2va", "t2va", "i2va", "fl2va", "l2va"]
 DURATIONS = ["5s (124f)", "6s (141f)", "8s (192f)", "10s (243f)", "12s (294f)", "15s (362f)"]
 CONTENT_MODES = ["SFW", "NSFW"]
-BACKENDS = ["openai_compatible", "cli"]
 STRENGTHS = ["subtle", "medium", "reimagine"]
 SOURCE_TYPES = ["h3_output", "user_written"]
 
@@ -133,14 +132,38 @@ def _build_user_content(scene_request, dialogue, voice_direction, submode,
 
 
 _BACKEND_INPUTS = {
-    "backend": (BACKENDS, {"default": "openai_compatible"}),
-    "base_url": ("STRING", {"default": "http://localhost:1234/v1"}),
-    "model": ("STRING", {"default": "local-model"}),
-    "api_key": ("STRING", {"default": ""}),
-    "cli_command": ("STRING", {"default": "claude -p --output-format text"}),
+    "backend": (BACKEND_NAMES, {
+        "default": "lmstudio",
+        "tooltip": "lmstudio/ollama/llamacpp/vllm = local OpenAI-compatible servers on their "
+                   "standard ports (1234/11434/8080/8000) — nothing else to type. "
+                   "openai_compat = any other OpenAI-compatible address (OpenRouter, Gemini, "
+                   "remote server) via base_url. claude_cli/gemini_cli/codex_cli = "
+                   "subscription CLIs. custom_cli = your own stdin->stdout command."}),
+    "base_url": ("STRING", {"default": "",
+        "tooltip": "Leave empty to use the selected backend's standard address. "
+                   "Fill in only for openai_compat or a non-standard port."}),
+    "model": ("STRING", {"default": "",
+        "tooltip": "Model name typed by hand. The server_model dropdown below wins "
+                   "when it is not (auto). Empty = the server's loaded/default model."}),
+    "api_key": ("STRING", {"default": "",
+        "tooltip": "Only needed for paid endpoints (OpenRouter, OpenAI, Gemini). "
+                   "Local servers ignore it."}),
+    "cli_command": ("STRING", {"default": "",
+        "tooltip": "CLI backends only. Leave empty to use the preset command "
+                   "(claude -p --output-format text / gemini -p / codex exec); "
+                   "required for custom_cli."}),
     "temperature": ("FLOAT", {"default": 0.75, "min": 0.0, "max": 2.0, "step": 0.05}),
-    "seed": ("INT", {"default": 0, "min": 0, "max": 0xFFFFFFFF, "control_after_generate": True}),
+    "seed": ("INT", {"default": 0, "min": 0, "max": 0xFFFFFFFF, "control_after_generate": True,
+        "tooltip": "Cache buster: change it to regenerate the same inputs."}),
 }
+
+def _server_model_widget():
+    """Dropdown of models found on local servers right now. (auto) = use the model field."""
+    return ([AUTO_MODEL] + discover_local_models(), {
+        "default": AUTO_MODEL,
+        "tooltip": "Models discovered on local servers (LM Studio/Ollama/llama.cpp/vLLM). "
+                   "Start the server, then refresh the browser to repopulate. "
+                   "(auto) = follow the model field above."})
 
 
 class H3PromptArchitect:
@@ -166,8 +189,15 @@ class H3PromptArchitect:
                 "audio_ref_note": ("STRING", {"default": ""}),
                 "custom_directives": ("STRING", {"multiline": True, "default": ""}),
                 "send_images_to_llm": ("BOOLEAN", {"default": True}),
+                "server_model": _server_model_widget(),
             },
         }
+
+    @classmethod
+    def VALIDATE_INPUTS(cls, server_model=None):
+        # server_model is a live list — a saved workflow may name a model that is
+        # not loaded right now, which must not invalidate the whole graph.
+        return True
 
     RETURN_TYPES = ("STRING", "INT", "STRING")
     RETURN_NAMES = ("prompt", "length_frames", "korean_summary")
@@ -178,11 +208,13 @@ class H3PromptArchitect:
                  backend, base_url, model, api_key, cli_command, temperature, seed,
                  images=None, dialogue="", voice_direction="", camera_direction="",
                  video_ref_note="", audio_ref_note="", custom_directives="",
-                 send_images_to_llm=True):
+                 send_images_to_llm=True, server_model=AUTO_MODEL):
         seconds = _duration_seconds(duration)
         is_nsfw = content_mode == "NSFW"
-        images_b64 = _images_to_base64(images) if (send_images_to_llm and backend == "openai_compatible") else []
-        image_count = len(_images_to_base64(images)) if images is not None else 0
+        is_http = not str(backend).endswith("_cli") and backend != "cli"
+        all_b64 = _images_to_base64(images) if images is not None else []
+        images_b64 = all_b64 if (send_images_to_llm and is_http) else []
+        image_count = len(all_b64)
 
         system_prompt = build_system_prompt(
             submode, seconds, is_nsfw,
@@ -196,7 +228,7 @@ class H3PromptArchitect:
         raw = call_llm(backend, base_url, model, api_key, cli_command,
                        system_prompt, user_content, images_base64=images_b64,
                        temperature=temperature if not is_nsfw else max(temperature, 0.9),
-                       seed=seed)
+                       seed=seed, server_model=server_model)
         prompt, frames, korean = _parse_llm_output(raw, seconds)
         return (prompt, frames, korean)
 
@@ -231,8 +263,13 @@ class H3PromptRemake:
                 "voice_direction": ("STRING", {"default": ""}),
                 "custom_directives": ("STRING", {"multiline": True, "default": ""}),
                 "send_images_to_llm": ("BOOLEAN", {"default": True}),
+                "server_model": _server_model_widget(),
             },
         }
+
+    @classmethod
+    def VALIDATE_INPUTS(cls, server_model=None):
+        return True
 
     RETURN_TYPES = ("STRING", "INT", "STRING")
     RETURN_NAMES = ("prompt", "length_frames", "korean_summary")
@@ -245,7 +282,7 @@ class H3PromptRemake:
                submode, duration, content_mode,
                backend, base_url, model, api_key, cli_command, temperature, seed,
                images=None, dialogue="", voice_direction="", custom_directives="",
-               send_images_to_llm=True):
+               send_images_to_llm=True, server_model=AUTO_MODEL):
         if not source_prompt.strip():
             raise ValueError("H3 Prompt Remake: source_prompt is empty — paste the prompt to remake.")
 
@@ -262,8 +299,10 @@ class H3PromptRemake:
         ] if flag]
         src_type = "custom" if source_type == "user_written" else "h3"
 
-        images_b64 = _images_to_base64(images) if (send_images_to_llm and backend == "openai_compatible") else []
-        image_count = len(_images_to_base64(images)) if images is not None else 0
+        is_http = not str(backend).endswith("_cli") and backend != "cli"
+        all_b64 = _images_to_base64(images) if images is not None else []
+        images_b64 = all_b64 if (send_images_to_llm and is_http) else []
+        image_count = len(all_b64)
 
         system_prompt = build_system_prompt(
             submode, seconds, is_nsfw,
@@ -278,7 +317,7 @@ class H3PromptRemake:
         # remakes are creative variation work — keep the higher temperature like the web app
         raw = call_llm(backend, base_url, model, api_key, cli_command,
                        system_prompt, user_content, images_base64=images_b64,
-                       temperature=max(temperature, 0.9), seed=seed)
+                       temperature=max(temperature, 0.9), seed=seed, server_model=server_model)
         prompt, frames, korean = _parse_llm_output(raw, seconds)
         return (prompt, frames, korean)
 

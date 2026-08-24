@@ -110,10 +110,91 @@ def call_cli(cli_command, system_prompt, user_text, timeout=600):
     return stdout
 
 
+AUTO_MODEL = "(auto)"
+
+# Backend presets — pick one and the standard address/command fills itself in.
+# (Same approach as ComfyUI-LLM-Hub: aliases share the OpenAI-compatible client,
+#  they only differ in the default port.)
+PRESET_BASE_URLS = {
+    "lmstudio": "http://127.0.0.1:1234/v1",
+    "ollama": "http://127.0.0.1:11434/v1",
+    "llamacpp": "http://127.0.0.1:8080/v1",
+    "vllm": "http://127.0.0.1:8000/v1",
+}
+PRESET_CLI_COMMANDS = {
+    "claude_cli": "claude -p --output-format text",
+    "gemini_cli": "gemini -p",
+    "codex_cli": "codex exec",
+}
+HTTP_BACKENDS = ["lmstudio", "ollama", "llamacpp", "vllm", "openai_compat"]
+CLI_BACKEND_LIST = ["claude_cli", "gemini_cli", "codex_cli", "custom_cli"]
+BACKEND_NAMES = HTTP_BACKENDS + CLI_BACKEND_LIST
+
+# v1.0 saved workflows used these names
+_BACKEND_ALIASES = {"openai_compatible": "openai_compat", "cli": "custom_cli"}
+
+
+def normalize_backend(name):
+    return _BACKEND_ALIASES.get(name, name)
+
+
+_MODEL_CACHE = {"at": 0.0, "ids": []}
+_MODEL_CACHE_TTL = 30.0
+
+
+def discover_local_models(timeout=0.8):
+    """Model ids from LLM servers running on THIS machine.
+
+    Loopback standard ports only (LM Studio 1234 / Ollama 11434 /
+    llama.cpp 8080 / vLLM 8000): closed local ports refuse instantly so
+    probing is effectively free, while probing remote hosts would stall
+    every page load. Results are cached for a short TTL. Failures are
+    silent — most users run only one (or none) of these servers.
+    """
+    import time
+    now = time.time()
+    if now - _MODEL_CACHE["at"] < _MODEL_CACHE_TTL:
+        return list(_MODEL_CACHE["ids"])
+    ids = []
+    for url in PRESET_BASE_URLS.values():
+        try:
+            req = urllib.request.Request(url.rstrip("/") + "/models")
+            with urllib.request.urlopen(req, timeout=timeout) as res:
+                data = json.loads(res.read().decode("utf-8", errors="replace"))
+            for m in data.get("data", []) or []:
+                mid = m.get("id") if isinstance(m, dict) else None
+                if mid and mid not in ids:
+                    ids.append(mid)
+        except Exception:
+            continue
+    _MODEL_CACHE["at"] = now
+    _MODEL_CACHE["ids"] = ids
+    return list(ids)
+
+
+def resolve_backend(backend, base_url, model, cli_command, server_model=AUTO_MODEL):
+    """Turn the widget values into a concrete (kind, url, model, command)."""
+    backend = normalize_backend(backend)
+    if backend in CLI_BACKEND_LIST:
+        cmd = (cli_command or "").strip() or PRESET_CLI_COMMANDS.get(backend, "")
+        if not cmd:
+            raise LLMError(f"Backend '{backend}' needs cli_command (e.g. 'claude -p --output-format text').")
+        return ("cli", "", "", cmd)
+    url = (base_url or "").strip() or PRESET_BASE_URLS.get(backend, "")
+    if not url:
+        raise LLMError(f"Backend '{backend}' needs base_url (an OpenAI-compatible /v1 address).")
+    mdl = model
+    if server_model and server_model != AUTO_MODEL:
+        mdl = server_model
+    return ("http", url, mdl, "")
+
+
 def call_llm(backend, base_url, model, api_key, cli_command, system_prompt,
-             user_text, images_base64=None, temperature=0.7, seed=-1, timeout=600):
-    if backend == "cli":
-        return call_cli(cli_command, system_prompt, user_text, timeout=timeout)
-    return call_openai_compatible(base_url, model, api_key, system_prompt, user_text,
+             user_text, images_base64=None, temperature=0.7, seed=-1, timeout=600,
+             server_model=AUTO_MODEL):
+    kind, url, mdl, cmd = resolve_backend(backend, base_url, model, cli_command, server_model)
+    if kind == "cli":
+        return call_cli(cmd, system_prompt, user_text, timeout=timeout)
+    return call_openai_compatible(url, mdl, api_key, system_prompt, user_text,
                                   images_base64=images_base64, temperature=temperature,
                                   seed=seed, timeout=timeout)
