@@ -139,19 +139,34 @@ def build_system_prompt(submode, duration_seconds, is_nsfw, camera_instruction="
     if remake:
         remake_directive = build_remake_directive(
             submode, remake.get("axes"), remake.get("strength", "medium"), remake.get("source_type", "h3"))
+    import math
+    is_multi = duration_seconds > 15.08
+    segments = math.ceil(duration_seconds / 15.08)
     multiseg_directive = ""
-    if duration_seconds > 15.08:
-        import math
-        segments = math.ceil(duration_seconds / 15.08)
+    if is_multi:
         multiseg_directive = (MULTISEG_TEMPLATE
                               .replace("\\u00abSEGMENTS\\u00bb", str(segments))
                               .replace("\\u00abDURATION\\u00bb", str(duration_seconds)))
+    # These must agree with the segment count, or the model gets contradictory
+    # instructions about how many code blocks to emit.
+    closing = (
+        ("Output exactly " + str(segments) + " consecutive prompts for target mode **"
+         + submode.upper() + "**, each in its own code block, each preceded by its "
+         "`Prompt k \\u2014 <references needed> \\u2014 length X (Y.YY s)` header. "
+         "Do not merge them into one block and do not stop after the first.")
+        if is_multi else
+        ("Output the single complete prompt for target mode **" + submode.upper()
+         + "**, followed by `length X (Y.YY s)`.")
+    )
+    block_rule = "one code block per segment (never all segments in one block)" if is_multi else "a single code block"
     base = (BASE_TEMPLATE
             .replace("\\u00abMODE\\u00bb", submode.upper())
             .replace("\\u00abDURATION\\u00bb", str(duration_seconds))
             .replace("\\u00abCAMERA\\u00bb", camera_text)
             .replace("\\u00abSAFETY\\u00bb", SAFETY_NSFW if is_nsfw else SAFETY_SFW)
             .replace("\\u00abMULTISEG\\u00bb", multiseg_directive)
+            .replace("\\u00abCLOSING\\u00bb", closing)
+            .replace("\\u00abBLOCKRULE\\u00bb", block_rule)
             .replace("\\u00abREMAKE\\u00bb", remake_directive))
     preamble = PREAMBLE_NSFW if is_nsfw else PREAMBLE_SFW
     custom_block = CUSTOM_DIRECTIVES_BLOCK.format(directives=custom_directives.strip()) if custom_directives.strip() else ""
@@ -159,8 +174,9 @@ def build_system_prompt(submode, duration_seconds, is_nsfw, camera_instruction="
 
 
 def nearest_grid_frames(duration_seconds):
+    """Snap UP to the next 17k+5 value, matching the guide (144 -> 158, not 141)."""
     target = duration_seconds * 24
-    return min(GRID_17K5, key=lambda f: abs(f - target))
+    return next((f for f in GRID_17K5 if f >= target), GRID_17K5[-1])
 '''.format(
         safety_nsfw=safety_nsfw, safety_sfw=safety_sfw,
         preamble_nsfw=preamble_nsfw, preamble_sfw=preamble_sfw,

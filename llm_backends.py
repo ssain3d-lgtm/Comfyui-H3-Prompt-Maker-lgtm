@@ -11,6 +11,8 @@ Two families:
 """
 
 import json
+import os
+import shlex
 import subprocess
 import urllib.request
 import urllib.error
@@ -37,7 +39,8 @@ def _post_json(url, payload, api_key, timeout):
 
 
 def call_openai_compatible(base_url, model, api_key, system_prompt, user_text,
-                           images_base64=None, temperature=0.7, seed=-1, timeout=600):
+                           images_base64=None, temperature=0.7, seed=-1, timeout=600,
+                           max_tokens=8192):
     url = base_url.rstrip("/") + "/chat/completions"
 
     if images_base64:
@@ -55,16 +58,20 @@ def call_openai_compatible(base_url, model, api_key, system_prompt, user_text,
             {"role": "user", "content": content},
         ],
         "temperature": temperature,
+        "max_tokens": max_tokens,
     }
     if seed is not None and seed >= 0:
         payload["seed"] = int(seed)
 
     try:
         data = _post_json(url, payload, api_key, timeout)
-    except LLMError:
-        if not images_base64:
+    except LLMError as first:
+        # Only a vision rejection is worth a second call. Retrying a dead server or a
+        # 401 just doubles the wait (and, on a paid endpoint, the bill).
+        msg = str(first).lower()
+        retryable = images_base64 and ("image" in msg or "vision" in msg or "content" in msg or "400" in msg)
+        if not retryable:
             raise
-        # Vision payload rejected (text-only model loaded) -> retry text-only
         payload["messages"][1]["content"] = user_text
         data = _post_json(url, payload, api_key, timeout)
 
@@ -88,10 +95,18 @@ def call_cli(cli_command, system_prompt, user_text, timeout=600):
     running `llama-server` and the openai_compatible backend instead.
     """
     full_prompt = f"{system_prompt}\n\n=== USER REQUEST ===\n{user_text}"
+    # No shell. A workflow JSON (or the PNG someone shares) carries cli_command as
+    # data, so `shell=True` would make "curl ... | sh" run on Queue.
+    try:
+        argv = shlex.split(cli_command)
+    except ValueError as e:
+        raise LLMError(f"Could not parse cli_command: {e}")
+    if not argv:
+        raise LLMError("cli_command is empty.")
     try:
         proc = subprocess.run(
-            cli_command,
-            shell=True,
+            argv,
+            shell=False,
             input=full_prompt.encode("utf-8"),
             capture_output=True,
             timeout=timeout,
@@ -189,12 +204,24 @@ def resolve_backend(backend, base_url, model, cli_command, server_model=AUTO_MOD
     return ("http", url, mdl, "")
 
 
+def resolve_api_key(api_key):
+    """Prefer the typed key, else the environment — so a shared workflow need not carry one."""
+    if (api_key or "").strip():
+        return api_key.strip()
+    for var in ("OPENAI_API_KEY", "OPENROUTER_API_KEY", "GEMINI_API_KEY", "H3_LLM_API_KEY"):
+        v = os.environ.get(var, "").strip()
+        if v:
+            return v
+    return ""
+
+
 def call_llm(backend, base_url, model, api_key, cli_command, system_prompt,
              user_text, images_base64=None, temperature=0.7, seed=-1, timeout=600,
-             server_model=AUTO_MODEL):
+             server_model=AUTO_MODEL, max_tokens=8192):
     kind, url, mdl, cmd = resolve_backend(backend, base_url, model, cli_command, server_model)
     if kind == "cli":
         return call_cli(cmd, system_prompt, user_text, timeout=timeout)
+    api_key = resolve_api_key(api_key)
     return call_openai_compatible(url, mdl, api_key, system_prompt, user_text,
                                   images_base64=images_base64, temperature=temperature,
-                                  seed=seed, timeout=timeout)
+                                  seed=seed, timeout=timeout, max_tokens=max_tokens)

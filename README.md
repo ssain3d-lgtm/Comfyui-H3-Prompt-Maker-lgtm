@@ -25,9 +25,13 @@ ComfyUI 재시작 후 노드 검색에서 `H3 Prompt Maker` 카테고리를 찾�
 
 | 출력 | 용도 |
 |---|---|
-| `prompt` (STRING) | H3 텍스트 인코딩 노드에 연결 |
-| `length_frames` (INT) | H3 length/frames 입력에 연결 (17k+5 그리드, LLM 추천값 파싱) |
+| `prompt` (STRING) | H3 텍스트 인코딩 노드에 연결 — **이번 렌더 한 개분**(분할 생성 시 세그먼트 1) |
+| `length_frames` (INT) | H3 length/frames 입력에 연결 — `prompt`와 항상 짝이 맞음 |
 | `korean_summary` (STRING) | 한국어 요약 (모델이 제공한 경우) |
+| `all_segments` (STRING) | 분할 생성 시 전체 시퀀스(헤더 포함). 단일 렌더면 `prompt`와 동일 |
+| `segment_count` (INT) | 세그먼트 개수 (단일 렌더 = 1) |
+
+코드펜스·`length` 라인·추론(`<think>`) 블록은 자동으로 제거되어 `prompt`는 붙여넣기 가능한 상태로 나옵니다.
 
 주요 입력: 장면 요청 · 세부모드(ref2va/t2va/i2va/fl2va/l2va) · 길이 프리셋 ·
 SFW/NSFW · 참조 이미지(IMAGE, 최대 9장 — `<Picture N>` 라벨 자동 부여) ·
@@ -62,6 +66,8 @@ SFW/NSFW · 참조 이미지(IMAGE, 최대 9장 — `<Picture N>` 라벨 자동 
 - 참조 이미지는 **비전 모델**(Qwen-VL, Gemma 3 비전 등)을 로드했을 때만 LLM이 직접 봅니다.
   비전 미지원 모델이면 자동으로 텍스트 전용으로 재시도합니다 (`send_images_to_llm` 끄기 가능).
 - 권장 로컬 모델: **Qwen3 14B 이상 인스트럭트** — 형식 준수가 빡빡해서 8B 이하는 자주 깨집니다.
+- `api_key`를 비워 두면 환경변수(`OPENAI_API_KEY` / `OPENROUTER_API_KEY` / `GEMINI_API_KEY` / `H3_LLM_API_KEY`)를 사용합니다.
+  **위젯에 직접 입력한 키는 워크플로우 JSON과 그 워크플로우로 만든 모든 PNG 메타데이터에 저장되므로**, 공유할 계획이면 환경변수를 쓰세요.
 
 ### `openai_compat` — 그 외 OpenAI 호환 주소 (base_url 직접 입력)
 
@@ -85,6 +91,18 @@ SFW/NSFW · 참조 이미지(IMAGE, 최대 9장 — `<Picture N>` 라벨 자동 
 
 CLI 방식은 프로세스 기동 오버헤드 때문에 HTTP 서버 방식보다 호출당 수 초 느리고,
 이미지 전달은 지원하지 않습니다(텍스트 전용).
+
+명령은 셸 없이 실행됩니다(`shlex.split` + `shell=False`). 공유받은 워크플로우의
+`cli_command`에 담긴 파이프·`;`·`$()` 체이닝이 실행되지 않도록 하기 위함입니다.
+
+## 테스트
+
+```bash
+python3 tests/test_parse.py        # 또는 python3 -m pytest tests/ -q
+```
+
+`_parse_llm_output`은 이 노드팩에서 유일하게 순수하면서 잘 깨지는 함수이고,
+INT 출력이 H3 샘플러로 직결되므로 출력 형태별 회귀 테스트를 고정해 두었습니다.
 
 ## 팁
 
