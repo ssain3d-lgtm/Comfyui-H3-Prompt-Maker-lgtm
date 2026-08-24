@@ -18,6 +18,8 @@ TOKEN_MAP = {
     'cameraInstructionText': '«CAMERA»',
     'safetyInstruction': '«SAFETY»',
     'remakeDirective': '«REMAKE»',
+    'multiSegmentDirective': '«MULTISEG»',
+    'segmentCount': '«SEGMENTS»',
     'axesText': '«AXES»',
     'strengthText': '«STRENGTH»',
     'sourceHandling': '«SOURCE_HANDLING»',
@@ -51,6 +53,7 @@ def main(server_ts_path):
         return tokenize_and_unescape(src[open_bt + 1:close_bt])
 
     base = extract_template('You are a prompt engineer for **MiniMax H3**')
+    multiseg = extract_template('*MULTI-SEGMENT DIRECTIVE (ACTIVE')
     remake = extract_template('*REMAKE MODE DIRECTIVE (ACTIVE):*')
     sh_custom = extract_template('- The source is a USER-AUTHORED')
     sh_h3 = extract_template('- PRESERVE VERBATIM (copy the exact wording')
@@ -68,11 +71,12 @@ def main(server_ts_path):
     strengths = extract_dict('REMAKE_STRENGTH_DESCRIPTIONS')
     assert len(axes) == 7 and len(strengths) == 3
 
-    for marker in ['«MODE»', '«DURATION»', '«CAMERA»', '«SAFETY»', '«REMAKE»',
+    for marker in ['«MODE»', '«DURATION»', '«CAMERA»', '«SAFETY»', '«REMAKE»', '«MULTISEG»',
                    'Writing a motion strip into the description', '## Limits',
                    'Voice control', 'REQUIREMENT COVERAGE', '17k+5',
                    'App execution context']:
         assert marker in base, f"missing in base: {marker}"
+    assert '«SEGMENTS»' in multiseg
 
     out_path = pathlib.Path(__file__).resolve().parent.parent / 'h3_prompts.py'
     py = '''"""
@@ -91,6 +95,8 @@ PREAMBLE_NSFW = {preamble_nsfw!r}
 PREAMBLE_SFW = {preamble_sfw!r}
 
 BASE_TEMPLATE = {base!r}
+
+MULTISEG_TEMPLATE = {multiseg!r}
 
 REMAKE_TEMPLATE = {remake!r}
 
@@ -133,11 +139,19 @@ def build_system_prompt(submode, duration_seconds, is_nsfw, camera_instruction="
     if remake:
         remake_directive = build_remake_directive(
             submode, remake.get("axes"), remake.get("strength", "medium"), remake.get("source_type", "h3"))
+    multiseg_directive = ""
+    if duration_seconds > 15.08:
+        import math
+        segments = math.ceil(duration_seconds / 15.08)
+        multiseg_directive = (MULTISEG_TEMPLATE
+                              .replace("\\u00abSEGMENTS\\u00bb", str(segments))
+                              .replace("\\u00abDURATION\\u00bb", str(duration_seconds)))
     base = (BASE_TEMPLATE
             .replace("\\u00abMODE\\u00bb", submode.upper())
             .replace("\\u00abDURATION\\u00bb", str(duration_seconds))
             .replace("\\u00abCAMERA\\u00bb", camera_text)
             .replace("\\u00abSAFETY\\u00bb", SAFETY_NSFW if is_nsfw else SAFETY_SFW)
+            .replace("\\u00abMULTISEG\\u00bb", multiseg_directive)
             .replace("\\u00abREMAKE\\u00bb", remake_directive))
     preamble = PREAMBLE_NSFW if is_nsfw else PREAMBLE_SFW
     custom_block = CUSTOM_DIRECTIVES_BLOCK.format(directives=custom_directives.strip()) if custom_directives.strip() else ""
@@ -150,7 +164,7 @@ def nearest_grid_frames(duration_seconds):
 '''.format(
         safety_nsfw=safety_nsfw, safety_sfw=safety_sfw,
         preamble_nsfw=preamble_nsfw, preamble_sfw=preamble_sfw,
-        base=base, remake=remake, sh_h3=sh_h3, sh_custom=sh_custom,
+        base=base, multiseg=multiseg, remake=remake, sh_h3=sh_h3, sh_custom=sh_custom,
         axes=axes, strengths=strengths,
     )
     out_path.write_text(py, encoding="utf-8")

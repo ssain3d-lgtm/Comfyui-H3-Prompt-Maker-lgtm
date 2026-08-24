@@ -14,7 +14,8 @@ from .h3_prompts import build_system_prompt, nearest_grid_frames
 from .llm_backends import call_llm, AUTO_MODEL, BACKEND_NAMES, discover_local_models
 
 SUBMODES = ["ref2va", "t2va", "i2va", "fl2va", "l2va"]
-DURATIONS = ["5s (124f)", "6s (141f)", "8s (192f)", "10s (243f)", "12s (294f)", "15s (362f)"]
+DURATIONS = ["5s (124f)", "6s (141f)", "8s (192f)", "10s (243f)", "12s (294f)", "15s (362f)",
+             "20s (2 segments)", "30s (2 segments)", "45s (3 segments)", "60s (4 segments)"]
 CONTENT_MODES = ["SFW", "NSFW"]
 STRENGTHS = ["subtle", "medium", "reimagine"]
 SOURCE_TYPES = ["h3_output", "user_written"]
@@ -50,7 +51,14 @@ def _images_to_base64(images, limit=9):
 
 
 def _parse_llm_output(text, fallback_seconds):
-    """Unwrap the prompt code block, pull out the recommended length line."""
+    """Unwrap the prompt code block, pull out the recommended length line.
+
+    Targets beyond one render (>15.08s) produce a multi-prompt sequence:
+    keep the full labeled text and report the per-render frame cap (362).
+    """
+    if fallback_seconds > 15.08:
+        return text.strip(), 362, ""
+
     frames = None
     m = None
     for m in _LENGTH_RE.finditer(text):
