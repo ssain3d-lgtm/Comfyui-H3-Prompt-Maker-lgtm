@@ -6,7 +6,7 @@ MiniMax H3 (비디오+오디오 옴니모달 모델) 전용 **프롬프트 생�
 결과를 **같은 워크플로우의 H3 노드에 바로 와이어로 연결**할 수 있습니다.
 
 [H3 Prompt Maker 웹앱](https://github.com/ssain3d-lgtm/minimax-h3-prompt-maker-google-studio-ai-v2)과
-동일한 시스템 프롬프트를 사용합니다 (server.ts에서 그대로 추출).
+동일한 시스템 프롬프트를 사용합니다 (prompts.ts에서 그대로 추출).
 
 ## 설치
 

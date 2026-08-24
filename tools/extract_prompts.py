@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
-"""Regenerate h3_prompts.py from the H3 Prompt Maker web app's server.ts.
+"""Regenerate h3_prompts.py from the H3 Prompt Maker web app's prompts.ts.
 
-Usage:  python3 tools/extract_prompts.py /path/to/webapp/server.ts
+Usage:  python3 tools/extract_prompts.py /path/to/webapp/prompts.ts
 
 Keeps this node pack's system prompts byte-identical to the web app
 (minimax-h3-prompt-maker-google-studio-ai-v2). Run it whenever the web
 app's H3 prompt changes, then commit the regenerated h3_prompts.py.
+
+The templates used to live in server.ts alongside the express routes; the
+web app moved every prompt string into prompts.ts so this tool has exactly
+one file to read. A prompt added to a route handler instead of prompts.ts
+is invisible here and silently desyncs the node pack — the assertions
+below catch a missing section, not a missing file.
 """
 
 import re
@@ -26,8 +32,8 @@ TOKEN_MAP = {
 }
 
 
-def main(server_ts_path):
-    src = open(server_ts_path, encoding="utf-8").read()
+def main(prompts_ts_path):
+    src = open(prompts_ts_path, encoding="utf-8").read()
 
     def tokenize_and_unescape(t):
         def sub(m):
@@ -81,7 +87,7 @@ def main(server_ts_path):
     out_path = pathlib.Path(__file__).resolve().parent.parent / 'h3_prompts.py'
     py = '''"""
 MiniMax H3 system prompts, extracted verbatim from the H3 Prompt Maker web app
-(minimax-h3-prompt-maker-google-studio-ai-v2, server.ts) so both stay in sync.
+(minimax-h3-prompt-maker-google-studio-ai-v2, prompts.ts) so both stay in sync.
 Regenerate with tools/extract_prompts.py — do not edit the constants by hand.
 Prompt guide adapted from https://github.com/teskor-hub/minimax-h3-skill (MIT, (c) 2026 teskor).
 """
@@ -184,7 +190,7 @@ def nearest_grid_frames(duration_seconds):
         axes=axes, strengths=strengths,
     )
     out_path.write_text(py, encoding="utf-8")
-    print(f"h3_prompts.py regenerated ({len(py)} chars) from {server_ts_path}")
+    print(f"h3_prompts.py regenerated ({len(py)} chars) from {prompts_ts_path}")
 
 
 if __name__ == "__main__":
