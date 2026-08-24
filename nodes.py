@@ -8,6 +8,7 @@ into ComfyUI's MiniMax H3 text/conditioning nodes (prompt STRING + frames INT).
 
 import base64
 import io
+import json
 import re
 
 from .h3_prompts import build_system_prompt, nearest_grid_frames
@@ -398,12 +399,70 @@ class H3PromptRemake:
         return (prompt, frames, korean, sequence, seg_count)
 
 
+class H3PromptMakerUI:
+    """The web app's own UI, opened over the ComfyUI canvas.
+
+    The node itself carries no settings — the overlay holds them, and "이 노드에
+    적용" writes the finished result into the hidden `result` widget. Execution
+    then just emits what was applied, so pressing Queue never silently spends
+    another LLM call or changes a prompt the user already approved. web/h3_maker.js
+    draws the two buttons and hides these widgets.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        hidden_str = lambda: ("STRING", {"default": "", "multiline": True})
+        return {
+            "required": {
+                # Filled by the overlay; the canvas never shows them.
+                "state": hidden_str(),   # the form, so a saved workflow reopens as it was
+                "llm": hidden_str(),     # backend/model chosen in the ⚙️ dialog
+                "result": hidden_str(),  # the applied output, as JSON
+            },
+        }
+
+    @classmethod
+    def VALIDATE_INPUTS(cls, **kwargs):
+        # These widgets are written by the overlay, not typed by a user; a
+        # half-written workflow must not invalidate the whole graph.
+        return True
+
+    RETURN_TYPES = ("STRING", "INT", "STRING", "STRING", "INT")
+    RETURN_NAMES = ("prompt", "length_frames", "korean_summary", "all_segments", "segment_count")
+    FUNCTION = "emit"
+    CATEGORY = "H3 Prompt Maker"
+
+    def emit(self, state="", llm="", result=""):
+        try:
+            data = json.loads(result) if str(result).strip() else {}
+        except (ValueError, TypeError):
+            data = {}
+        prompt = str(data.get("prompt") or "").strip()
+        if not prompt:
+            raise RuntimeError(
+                "H3 Prompt Maker: 아직 적용된 프롬프트가 없습니다. "
+                "노드의 '🎬 프롬프트 메이커 열기'를 눌러 생성한 뒤 '이 노드에 적용'을 누르세요."
+            )
+        frames = data.get("lengthFrames")
+        if not isinstance(frames, int) or frames <= 0:
+            frames = nearest_grid_frames(10)
+        return (
+            prompt,
+            frames,
+            str(data.get("koreanSummary") or ""),
+            str(data.get("allSegments") or prompt),
+            int(data.get("segmentCount") or 1),
+        )
+
+
 NODE_CLASS_MAPPINGS = {
     "H3PromptArchitect": H3PromptArchitect,
     "H3PromptRemake": H3PromptRemake,
+    "H3PromptMakerUI": H3PromptMakerUI,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "H3PromptArchitect": "MiniMax H3 Prompt Architect 🎬",
     "H3PromptRemake": "MiniMax H3 Prompt Remake 🔄",
+    "H3PromptMakerUI": "MiniMax H3 Prompt Maker (UI) 🖥️",
 }

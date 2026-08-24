@@ -1,0 +1,16 @@
+name: CI
+on: [push, pull_request]
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python3 tests/test_parse.py
+      - run: python3 tests/test_routes.py
+      # The overlay is a committed build artifact, so it can silently go stale.
+      # This does not rebuild it (that needs the web app checkout) — it checks
+      # that what is committed is servable and self-contained.
+      - run: python3 tools/check_bundle.py

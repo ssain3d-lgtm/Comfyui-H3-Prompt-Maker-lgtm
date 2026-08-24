@@ -17,8 +17,35 @@ git clone https://github.com/ssain3d-lgtm/Comfyui-H3-Prompt-Maker-lgtm-.git
 ```
 
 ComfyUI 재시작 후 노드 검색에서 `H3 Prompt Maker` 카테고리를 찾으세요.
+UI 방식을 원하면 **MiniMax H3 Prompt Maker (UI) 🖥️** 를, 그래프에 직접 와이어링하려면
+**Prompt Architect 🎬** 를 추가하세요.
 
 ## 노드
+
+### 🖥️ MiniMax H3 Prompt Maker (UI)
+**웹앱 UI를 ComfyUI 위에 그대로 띄우는 노드.** 노드에는 버튼 두 개뿐입니다.
+
+| 버튼 | 하는 일 |
+|---|---|
+| 🎬 프롬프트 메이커 열기 | 웹앱 화면 전체를 오버레이로 엽니다 — 세부 모드·길이·SFW/NSFW·장면 요청·대사·목소리·카메라·리메이크 모드·참조 첨부·오디오 트림·히스토리 전부 동일 |
+| ⚙️ 모델 연결 | 백엔드 / base_url / 모델 / API 키 / CLI 명령 / temperature. **이 노드가 직접 설정하는 것은 이것뿐입니다** |
+
+오버레이에서 생성한 뒤 **'이 노드에 적용'** 을 누르면 결과가 노드 출력
+(`prompt` / `length_frames` / `korean_summary` / `all_segments` / `segment_count`)으로 나갑니다.
+Queue를 눌러도 LLM을 다시 호출하지 않습니다 — 눈으로 확인하고 승인한 프롬프트만 렌더에 들어갑니다.
+아직 적용한 게 없으면 실행이 그 사실을 말하며 멈춥니다.
+
+알아두실 점:
+
+- **참조 미디어는 워크플로우에 저장되지 않습니다.** ComfyUI 워크플로우는 그 워크플로우로 만든
+  모든 PNG 메타데이터에 통째로 들어가므로, 10MB 오디오를 넣으면 출력 이미지마다 따라다닙니다.
+  장면·설정 텍스트만 저장되고, 첨부는 ComfyUI를 켜 둔 동안 창을 닫았다 열어도 유지됩니다.
+- **마스크 → AI 인페인팅은 없습니다.** Gemini 이미지 모델 전용 기능이라 로컬 LLM으로 대체할 수 없습니다.
+  ComfyUI의 인페인트 노드를 그래프에서 쓰세요.
+- 오버레이는 **완전 오프라인**입니다. Tailwind를 CDN이 아니라 빌드된 CSS로 싣습니다.
+
+아래 두 노드는 그래프에 직접 와이어링하고 싶을 때 쓰는 위젯 방식입니다. UI 노드와 같은
+시스템 프롬프트·같은 출력 5개를 냅니다.
 
 ### 🎬 MiniMax H3 Prompt Architect
 장면 요청 → 완성된 H3 프롬프트.
@@ -95,14 +122,31 @@ CLI 방식은 프로세스 기동 오버헤드 때문에 HTTP 서버 방식보�
 명령은 셸 없이 실행됩니다(`shlex.split` + `shell=False`). 공유받은 워크플로우의
 `cli_command`에 담긴 파이프·`;`·`$()` 체이닝이 실행되지 않도록 하기 위함입니다.
 
+## 웹앱과 동기화
+
+이 저장소는 웹앱에서 두 가지를 그대로 가져옵니다 — 시스템 프롬프트(`h3_prompts.py`)와
+오버레이 UI(`web/app/`). 둘 다 **생성물이고 커밋되어 있습니다**(사용자가 npm을 돌릴 필요 없음).
+웹앱이 바뀌면 손으로 고치지 말고 재생성하세요:
+
+```bash
+python3 tools/sync_app.py /path/to/minimax-h3-prompt-maker-google-studio-ai-v2
+```
+
+프롬프트 추출 → 오버레이 빌드 → `web/app/` 교체를 한 번에 하고, 번들에 CDN 참조가
+남아 있으면 실패합니다.
+
 ## 테스트
 
 ```bash
-python3 tests/test_parse.py        # 또는 python3 -m pytest tests/ -q
+python3 tests/test_parse.py     # 출력 파서 회귀 (INT 출력이 H3 샘플러로 직결됨)
+python3 tests/test_routes.py    # 오버레이 HTTP 계층 — 경로 탈출 차단, 요청 번역
+python3 tools/check_bundle.py   # 커밋된 번들이 서빙 가능하고 외부 참조가 없는지
 ```
 
 `_parse_llm_output`은 이 노드팩에서 유일하게 순수하면서 잘 깨지는 함수이고,
 INT 출력이 H3 샘플러로 직결되므로 출력 형태별 회귀 테스트를 고정해 두었습니다.
+라우트 쪽은 ComfyUI 서버에 얹히는데 ComfyUI에는 자체 인증이 없으므로,
+호출자가 준 문자열이 파일 시스템에 닿는 유일한 지점(정적 파일 핸들러)을 특히 고정해 두었습니다.
 
 ## 팁
 

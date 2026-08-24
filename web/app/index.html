@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>MiniMax H3 Prompt Maker</title>
+    <link rel="stylesheet" href="./tailwind.css" />
+    <!--
+      Colour semantics — one hue, one meaning. Before this was written down, amber
+      meant video AND warning AND system directives, emerald meant audio AND
+      "directive active", and the primary action was indigo in the app shell but
+      blue in the shared Button. Pick from this table rather than adding a hue:
+
+        gray     surfaces, body copy, disabled
+        indigo   primary action, reference pictures
+        amber    video references        (<Video N>)
+        emerald  audio references        (<Audio N>), copy-succeeded
+        sky      user system directives
+        fuchsia  remake mode
+        purple   multi-segment / AI-generated edits
+        orange   warnings (recoverable, the user can continue)
+        red      errors and destructive actions
+        rose     storyboard mode badge
+        pink     brand gradient accent only — never on its own
+    -->
+    
+    <style>
+      body {
+        background-color: #0d1117;
+        color: #e5e7eb;
+      }
+      /* Custom scrollbar for code blocks */
+      ::-webkit-scrollbar {
+        width: 8px;
+        height: 8px;
+      }
+      ::-webkit-scrollbar-track {
+        background: #1a202c; 
+      }
+      ::-webkit-scrollbar-thumb {
+        background: #4a5568; 
+        border-radius: 4px;
+      }
+      ::-webkit-scrollbar-thumb:hover {
+        background: #718096; 
+      }
+      /* Keyboard users had no way to tell where focus was: the app styles
+         everything with Tailwind utilities and none of them set a focus ring,
+         while several controls are divs. One default covers every control;
+         :focus-visible keeps it off mouse clicks. */
+      :focus-visible {
+        outline: 2px solid #818cf8;
+        outline-offset: 2px;
+        border-radius: 4px;
+      }
+      @media (prefers-reduced-motion: reduce) {
+        *, *::before, *::after {
+          animation-duration: 0.01ms !important;
+          animation-iteration-count: 1 !important;
+          transition-duration: 0.01ms !important;
+        }
+      }
+    </style>
+  
+<link rel="stylesheet" href="./index.css">
+  <script type="module" crossorigin src="./assets/index-wte8C7X3.js"></script>
+</head>
+  <body>
+    <div id="root"></div>
+</body>
+</html>
