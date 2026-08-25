@@ -43,12 +43,23 @@ UI 방식을 원하면 **MiniMax H3 Prompt Maker (UI) 🖥️** 를, 그래프�
 5. 주소·키를 다시 건드리면 확인 상태가 해제됩니다 — 확인하지 않은 설정이 확인된 것처럼
    보이지 않게 하기 위함입니다.
 
+**thinking (기본 auto)** — 추론 모델의 사고를 켜고 끕니다.
+
+| 값 | 동작 |
+|---|---|
+| `auto` | 모델 기본값에 맡김 |
+| `off` | 사고를 끄고 **예산 전부를 답변에** — 한 줄만 돌아오는 증상의 직접적인 해법 |
+| `on` | 사고를 강제로 켬 |
+
+`/no_think` 토큰과 `chat_template_kwargs`(vLLM·최신 LM Studio)를 함께 보냅니다.
+후자를 모르는 서버가 요청을 거부하면 그 필드만 빼고 자동으로 다시 보내므로,
+어느 백엔드에서도 안전합니다. CLI 백엔드는 토큰만 붙습니다.
+
 **max_tokens (기본 60000)** — 응답 상한입니다. 추론 모델(Qwen3 등)은 답하기 전에 이 예산을
 **생각하는 데** 씁니다. 낮으면 사고 블록이 예산을 다 먹고 본문 없이 한 줄만 돌아옵니다.
 느린 하드웨어에서 응답이 너무 오래 걸리면 줄이고, 긴 프롬프트가 잘리면 올리세요.
 
-Qwen3 계열에서 계속 한 줄만 나오면 장면 요청 끝에 `/no_think`를 붙여 사고를 꺼도 됩니다.
-(사고 블록 안에 본문을 다 써버린 경우는 앱이 알아서 그 안의 프롬프트를 꺼내 씁니다.)
+사고 블록 안에 본문을 다 써버린 경우는 앱이 알아서 그 안의 프롬프트를 꺼내 씁니다.
 
 노드 얼굴에 연결 상태가 한 줄로 남습니다: `● lmstudio · qwen3-14b-instruct`
 (● = 연결 확인됨, ○ = 저장만 됨).
@@ -167,6 +178,7 @@ python3 tools/sync_app.py /path/to/minimax-h3-prompt-maker-google-studio-ai-v3
 python3 tests/test_parse.py     # 출력 파서 회귀 (INT 출력이 H3 샘플러로 직결됨)
 python3 tests/test_routes.py    # 오버레이 HTTP 계층 — 경로 탈출 차단, 요청 번역
 python3 tests/test_system_prompt.py  # H3 시스템 프롬프트가 실제 요청에 실리는지 (가짜 LLM 서버로 본문 캡처)
+python3 tests/test_thinking.py       # thinking 모드가 실제 요청에 실리는지 + 거부 서버 폴백
 python3 tools/check_bundle.py   # 커밋된 번들이 서빙 가능하고 외부 참조가 없는지
 ```
 

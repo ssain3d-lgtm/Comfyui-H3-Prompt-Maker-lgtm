@@ -192,6 +192,27 @@ _js = (_PACK / "web" / "h3_maker.js").read_text(encoding="utf-8")
 ok("tokens: the dialog offers a field for it", "inputs.max_tokens" in _js)
 ok("tokens: and saves what was typed", 'max_tokens: Number(inputs.max_tokens.value)' in _js)
 
+# --- thinking switch --------------------------------------------------------
+from h3pack.llm_backends import apply_thinking  # noqa: E402
+
+eq("thinking: defaults to the model's own behaviour", R._llm_settings({})["thinking"], "auto")
+eq("thinking: off is honoured", R._llm_settings({"llm": {"thinking": "off"}})["thinking"], "off")
+eq("thinking: on is honoured", R._llm_settings({"llm": {"thinking": "on"}})["thinking"], "on")
+eq("thinking: an unknown mode falls back rather than reaching the model",
+   R._llm_settings({"llm": {"thinking": "sometimes"}})["thinking"], "auto")
+
+eq("thinking: auto leaves the user turn untouched", apply_thinking("장면", "auto"), "장면")
+ok("thinking: off appends the token Qwen3 reads", apply_thinking("장면", "off").endswith("/no_think"))
+ok("thinking: on appends the opposite", apply_thinking("장면", "on").endswith("/think"))
+ok("thinking: the scene text survives either way", apply_thinking("장면", "off").startswith("장면"))
+
+_src = (_PACK / "server_routes.py").read_text(encoding="utf-8")
+ok("thinking: the route forwards it", 'thinking=cfg["thinking"]' in _src)
+_js = (_PACK / "web" / "h3_maker.js").read_text(encoding="utf-8")
+ok("thinking: the dialog offers the three modes",
+   'inputs.thinking' in _js and '"off"' in _js and '"on"' in _js)
+ok("thinking: and saves the choice", 'thinking: inputs.thinking.value' in _js)
+
 # --- constants the frontend relies on ---------------------------------------
 eq("prefix matches the app's API_BASE", R.PREFIX + "/api", "/h3_prompt_maker/api")
 ok("body cap is generous enough for inline media", R.MAX_BODY_BYTES >= 32 * 1024 * 1024)

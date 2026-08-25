@@ -56,10 +56,51 @@ def clamp_max_tokens(value, default=DEFAULT_MAX_TOKENS):
     return max(MIN_MAX_TOKENS, min(MAX_MAX_TOKENS, n))
 
 
+#: Whether to let a reasoning model think before answering.
+#: "auto"  send nothing — the model's own default
+#: "off"   suppress it: the whole budget goes to the answer
+#: "on"    force it on
+THINKING_MODES = ["auto", "off", "on"]
+
+#: Qwen3 and its derivatives read these as commands from the user turn. They are
+#: plain text, so a model that does not know them simply ignores them — which is
+#: why this is the portable half of the switch.
+_THINK_TOKENS = {"off": "/no_think", "on": "/think"}
+
+
+def apply_thinking(user_text, mode):
+    """Append the control token for `mode`. Returns the text unchanged for auto."""
+    token = _THINK_TOKENS.get(mode)
+    if not token:
+        return user_text
+    return f"{user_text}\n\n{token}"
+
+
+def _extract_text(data):
+    """The answer, with a separately-returned reasoning block folded back in."""
+    try:
+        message = data["choices"][0]["message"]
+        text = message.get("content")
+    except (KeyError, IndexError, TypeError, AttributeError):
+        raise LLMError(f"Unexpected LLM response shape: {str(data)[:500]}")
+
+    # LM Studio and others hand a reasoning model's thinking back in its own
+    # field instead of inline. When the model spent that field on the actual
+    # prompt and left only a note in content, the answer is still here — put it
+    # back as a <think> block so the parsers can recover it.
+    reasoning = message.get("reasoning_content") or message.get("reasoning")
+    if reasoning and isinstance(reasoning, str) and reasoning.strip():
+        text = f"<think>{reasoning}</think>\n{text or ''}"
+    if not text or not text.strip():
+        raise LLMError("LLM returned an empty response.")
+    return text
+
+
 def call_openai_compatible(base_url, model, api_key, system_prompt, user_text,
                            images_base64=None, temperature=0.7, seed=-1, timeout=600,
-                           max_tokens=DEFAULT_MAX_TOKENS):
+                           max_tokens=DEFAULT_MAX_TOKENS, thinking="auto"):
     url = base_url.rstrip("/") + "/chat/completions"
+    user_text = apply_thinking(user_text, thinking)
 
     if images_base64:
         content = [{"type": "text", "text": user_text}]
@@ -80,35 +121,30 @@ def call_openai_compatible(base_url, model, api_key, system_prompt, user_text,
     }
     if seed is not None and seed >= 0:
         payload["seed"] = int(seed)
+    if thinking in ("off", "on"):
+        # vLLM and recent LM Studio builds switch Qwen3's chat template with
+        # this. It is the reliable half of the switch where it is supported;
+        # the /no_think token already in user_text covers everywhere else.
+        payload["chat_template_kwargs"] = {"enable_thinking": thinking == "on"}
+
+    def post():
+        return _post_json(url, payload, api_key, timeout)
 
     try:
-        data = _post_json(url, payload, api_key, timeout)
+        return _extract_text(post())
     except LLMError as first:
-        # Only a vision rejection is worth a second call. Retrying a dead server or a
-        # 401 just doubles the wait (and, on a paid endpoint, the bill).
         msg = str(first).lower()
-        retryable = images_base64 and ("image" in msg or "vision" in msg or "content" in msg or "400" in msg)
-        if not retryable:
-            raise
-        payload["messages"][1]["content"] = user_text
-        data = _post_json(url, payload, api_key, timeout)
-
-    try:
-        message = data["choices"][0]["message"]
-        text = message.get("content")
-    except (KeyError, IndexError, TypeError, AttributeError):
-        raise LLMError(f"Unexpected LLM response shape: {str(data)[:500]}")
-
-    # Some servers (LM Studio among them) hand a reasoning model's thinking back
-    # in its own field instead of inline. When the model spent that field on the
-    # actual prompt and left only a note in content, the answer is still here —
-    # re-attach it as a <think> block so the parsers can recover it.
-    reasoning = message.get("reasoning_content") or message.get("reasoning")
-    if reasoning and isinstance(reasoning, str) and reasoning.strip():
-        text = f"<think>{reasoning}</think>\n{text or ''}"
-    if not text or not text.strip():
-        raise LLMError("LLM returned an empty response.")
-    return text
+        # A server that does not know chat_template_kwargs may reject the whole
+        # request. Drop it and let the text token carry the intent alone.
+        if "chat_template_kwargs" in payload and ("400" in msg or "template" in msg or "extra" in msg):
+            payload.pop("chat_template_kwargs")
+            return _extract_text(post())
+        # Only a vision rejection is worth a second call. Retrying a dead server
+        # or a 401 just doubles the wait (and, on a paid endpoint, the bill).
+        if images_base64 and ("image" in msg or "vision" in msg or "content" in msg or "400" in msg):
+            payload["messages"][1]["content"] = user_text
+            return _extract_text(post())
+        raise
 
 
 def call_cli(cli_command, system_prompt, user_text, timeout=600):
@@ -244,14 +280,16 @@ def resolve_api_key(api_key):
 
 def call_llm(backend, base_url, model, api_key, cli_command, system_prompt,
              user_text, images_base64=None, temperature=0.7, seed=-1, timeout=600,
-             server_model=AUTO_MODEL, max_tokens=DEFAULT_MAX_TOKENS):
+             server_model=AUTO_MODEL, max_tokens=DEFAULT_MAX_TOKENS, thinking="auto"):
     kind, url, mdl, cmd = resolve_backend(backend, base_url, model, cli_command, server_model)
     if kind == "cli":
-        return call_cli(cmd, system_prompt, user_text, timeout=timeout)
+        # A CLI runner has no template switch; the text token is all there is.
+        return call_cli(cmd, system_prompt, apply_thinking(user_text, thinking), timeout=timeout)
     api_key = resolve_api_key(api_key)
     return call_openai_compatible(url, mdl, api_key, system_prompt, user_text,
                                   images_base64=images_base64, temperature=temperature,
-                                  seed=seed, timeout=timeout, max_tokens=max_tokens)
+                                  seed=seed, timeout=timeout, max_tokens=max_tokens,
+                                  thinking=thinking)
 
 
 def probe_backend(backend, base_url, api_key, cli_command, timeout=6.0):

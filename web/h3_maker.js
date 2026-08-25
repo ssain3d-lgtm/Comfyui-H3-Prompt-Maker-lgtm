@@ -38,6 +38,8 @@ const DEFAULT_LLM = {
   // A reasoning model spends this thinking before it answers; 8192 left a
   // Qwen3-class model emitting one line of assumptions as its "answer".
   max_tokens: 60000,
+  //  auto  the model's own default | off  suppress it | on  force it
+  thinking: "auto",
   /** Epoch ms of the last successful 연결 확인, 0 when never checked. */
   verifiedAt: 0,
 };
@@ -323,13 +325,23 @@ const openSettings = async (node) => {
   inputs.temperature = el("input", FIELD_STYLE, { type: "number", step: "0.05", min: "0", max: "2", value: cfg.temperature });
   row("temperature", "temperature", inputs.temperature);
 
+  inputs.thinking = el("select", FIELD_STYLE);
+  for (const [value, label] of [
+    ["auto", "auto — 모델 기본값"],
+    ["off", "off — 사고 끄기 (예산 전부를 답변에)"],
+    ["on", "on — 사고 켜기"],
+  ]) inputs.thinking.append(new Option(label, value));
+  inputs.thinking.value = cfg.thinking || "auto";
+  row("thinking", "thinking", inputs.thinking);
+
   inputs.max_tokens = el("input", FIELD_STYLE, {
     type: "number", step: "1024", min: "1024", max: "1000000", value: cfg.max_tokens,
   });
   row("max_tokens", "max_tokens", inputs.max_tokens);
   const tokenHint = el("p", { margin: "-4px 0 0 104px", fontSize: "11px", color: "#8b949e", lineHeight: "1.5" }, {
-    textContent: "응답 상한. 추론 모델은 답하기 전에 이 예산을 생각하는 데 씁니다 — "
-               + "너무 낮으면 본문 없이 한 줄만 돌아옵니다. 기본 60000.",
+    textContent: "thinking: Qwen3 같은 추론 모델은 답하기 전에 max_tokens 예산을 생각하는 데 씁니다. "
+               + "off로 두면 그 예산이 전부 답변으로 갑니다 (/no_think + 템플릿 스위치, 모르는 서버는 무시). "
+               + "max_tokens: 너무 낮으면 본문 없이 한 줄만 돌아옵니다. 기본 60000.",
   });
   box.append(tokenHint);
 
@@ -451,6 +463,7 @@ const openSettings = async (node) => {
       model: inputs.server_model.value === "(auto)" ? "" : inputs.server_model.value,
       temperature: Number(inputs.temperature.value) || 0.7,
       max_tokens: Number(inputs.max_tokens.value) || 60000,
+      thinking: inputs.thinking.value,
       // Recorded so the node face can distinguish a checked configuration from
       // one that was merely typed in and saved.
       verifiedAt: verified ? Date.now() : 0,

@@ -18,8 +18,8 @@ import traceback
 from .h3_prompts import build_system_prompt, nearest_grid_frames
 from .llm_backends import (
     AUTO_MODEL, BACKEND_NAMES, LLMError, PRESET_BASE_URLS, PRESET_CLI_COMMANDS,
-    call_llm, clamp_max_tokens, discover_local_models, normalize_backend,
-    probe_backend, warm_up_model,
+    THINKING_MODES, call_llm, clamp_max_tokens, discover_local_models,
+    normalize_backend, probe_backend, warm_up_model,
 )
 
 PREFIX = "/h3_prompt_maker"
@@ -123,6 +123,8 @@ def _llm_settings(body):
         "temperature": max(0.0, min(2.0, temperature)),
         "server_model": str(llm.get("server_model") or AUTO_MODEL),
         "max_tokens": clamp_max_tokens(llm.get("max_tokens")),
+        "thinking": (str(llm.get("thinking") or "auto")
+                     if str(llm.get("thinking") or "auto") in THINKING_MODES else "auto"),
     }
 
 
@@ -153,6 +155,7 @@ def register(routes):
     async def backends(request):
         return _json({
             "backends": BACKEND_NAMES,
+            "thinking_modes": THINKING_MODES,
             "preset_base_urls": PRESET_BASE_URLS,
             "preset_cli_commands": PRESET_CLI_COMMANDS,
             "models": discover_local_models(),
@@ -237,7 +240,7 @@ def register(routes):
                 cfg["backend"], cfg["base_url"], cfg["model"], cfg["api_key"], cfg["cli_command"],
                 system_prompt, user_text, images_base64=send_images,
                 temperature=cfg["temperature"], server_model=cfg["server_model"],
-                max_tokens=cfg["max_tokens"],
+                max_tokens=cfg["max_tokens"], thinking=cfg["thinking"],
             )
         except LLMError as exc:
             return _json({"error": str(exc), "reason": "transient"}, status=502)
