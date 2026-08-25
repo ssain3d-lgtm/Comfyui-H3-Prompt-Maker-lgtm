@@ -18,7 +18,8 @@ import traceback
 from .h3_prompts import build_system_prompt, nearest_grid_frames
 from .llm_backends import (
     AUTO_MODEL, BACKEND_NAMES, LLMError, PRESET_BASE_URLS, PRESET_CLI_COMMANDS,
-    call_llm, discover_local_models, normalize_backend, probe_backend, warm_up_model,
+    call_llm, clamp_max_tokens, discover_local_models, normalize_backend,
+    probe_backend, warm_up_model,
 )
 
 PREFIX = "/h3_prompt_maker"
@@ -121,6 +122,7 @@ def _llm_settings(body):
         "cli_command": str(llm.get("cli_command") or ""),
         "temperature": max(0.0, min(2.0, temperature)),
         "server_model": str(llm.get("server_model") or AUTO_MODEL),
+        "max_tokens": clamp_max_tokens(llm.get("max_tokens")),
     }
 
 
@@ -235,6 +237,7 @@ def register(routes):
                 cfg["backend"], cfg["base_url"], cfg["model"], cfg["api_key"], cfg["cli_command"],
                 system_prompt, user_text, images_base64=send_images,
                 temperature=cfg["temperature"], server_model=cfg["server_model"],
+                max_tokens=cfg["max_tokens"],
             )
         except LLMError as exc:
             return _json({"error": str(exc), "reason": "transient"}, status=502)

@@ -128,6 +128,28 @@ def test_grid_rounds_up():
     assert nodes.nearest_grid_frames(999) == 362
 
 
+def test_prompt_written_inside_the_reasoning_block_is_recovered():
+    """Qwen3 thinks by default; when it writes the prompt inside <think> and
+    leaves a note outside, discarding the block discards the answer."""
+    body = ("subject_definitions:\n<Subject 1> is a woman.\n\n"
+            "summary:\n[reference generation] a 10-second take.\n\n"
+            "detailed_description:\n[Shot 1] she shifts her weight...")
+    raw = "<think>%s</think>\nAssumptions: <Picture 1> is the sole reference.\nlength 243 (10.13 s)" % body
+    prompt, frames, _korean, _seq, _n = _load()._parse_llm_output(raw, 10)
+    assert "subject_definitions" in prompt, prompt[:120]
+    assert not prompt.startswith("Assumptions"), prompt[:120]
+    assert frames == 243, frames          # the length line lives outside the block
+
+
+def test_reasoning_is_still_discarded_when_the_answer_is_real():
+    body = "subject_definitions:\nx\nsummary:\ny\ndetailed_description:\nz"
+    raw = "<think>let me consider the lighting</think>\n```\n%s\n```\nlength 243 (10.13 s)" % body
+    prompt, frames, _k, _s, _n = _load()._parse_llm_output(raw, 10)
+    assert "let me consider" not in prompt
+    assert "subject_definitions" in prompt
+    assert frames == 243
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in sorted(globals().items()):
@@ -140,3 +162,4 @@ if __name__ == "__main__":
                 print(f"  FAIL  {name}: {e}")
     print("\nALL PASS" if not failures else f"\n{failures} FAILED")
     sys.exit(1 if failures else 0)
+

@@ -38,9 +38,27 @@ def _post_json(url, payload, api_key, timeout):
         raise LLMError(f"Cannot reach LLM server at {url}: {e.reason}") from e
 
 
+#: A reasoning model spends this budget thinking before it answers. At 8192 a
+#: Qwen3-class model could burn nearly all of it inside <think> and emit a
+#: single line of assumptions as the "answer" — which is exactly what happened.
+#: An H3 prompt is ~600 words; the headroom is for the thinking, not the output.
+DEFAULT_MAX_TOKENS = 60000
+MIN_MAX_TOKENS = 1024
+MAX_MAX_TOKENS = 1000000
+
+
+def clamp_max_tokens(value, default=DEFAULT_MAX_TOKENS):
+    """Keep a hand-typed value inside what a server will accept. Never raises."""
+    try:
+        n = int(float(value))
+    except (TypeError, ValueError):
+        return default
+    return max(MIN_MAX_TOKENS, min(MAX_MAX_TOKENS, n))
+
+
 def call_openai_compatible(base_url, model, api_key, system_prompt, user_text,
                            images_base64=None, temperature=0.7, seed=-1, timeout=600,
-                           max_tokens=8192):
+                           max_tokens=DEFAULT_MAX_TOKENS):
     url = base_url.rstrip("/") + "/chat/completions"
 
     if images_base64:
@@ -76,9 +94,18 @@ def call_openai_compatible(base_url, model, api_key, system_prompt, user_text,
         data = _post_json(url, payload, api_key, timeout)
 
     try:
-        text = data["choices"][0]["message"]["content"]
-    except (KeyError, IndexError, TypeError):
+        message = data["choices"][0]["message"]
+        text = message.get("content")
+    except (KeyError, IndexError, TypeError, AttributeError):
         raise LLMError(f"Unexpected LLM response shape: {str(data)[:500]}")
+
+    # Some servers (LM Studio among them) hand a reasoning model's thinking back
+    # in its own field instead of inline. When the model spent that field on the
+    # actual prompt and left only a note in content, the answer is still here —
+    # re-attach it as a <think> block so the parsers can recover it.
+    reasoning = message.get("reasoning_content") or message.get("reasoning")
+    if reasoning and isinstance(reasoning, str) and reasoning.strip():
+        text = f"<think>{reasoning}</think>\n{text or ''}"
     if not text or not text.strip():
         raise LLMError("LLM returned an empty response.")
     return text
@@ -217,7 +244,7 @@ def resolve_api_key(api_key):
 
 def call_llm(backend, base_url, model, api_key, cli_command, system_prompt,
              user_text, images_base64=None, temperature=0.7, seed=-1, timeout=600,
-             server_model=AUTO_MODEL, max_tokens=8192):
+             server_model=AUTO_MODEL, max_tokens=DEFAULT_MAX_TOKENS):
     kind, url, mdl, cmd = resolve_backend(backend, base_url, model, cli_command, server_model)
     if kind == "cli":
         return call_cli(cmd, system_prompt, user_text, timeout=timeout)

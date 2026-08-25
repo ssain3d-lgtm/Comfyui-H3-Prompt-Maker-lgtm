@@ -173,6 +173,25 @@ eq("body: over the cap returns None rather than a partial parse", _over, None)
 _empty = asyncio.new_event_loop().run_until_complete(R._read_body(_FakeRequest(b"")))
 eq("body: an empty body is empty, not an error", _empty, b"")
 
+# --- max_tokens, typed in the dialog and carried to the model ---------------
+# A reasoning model spends this budget thinking. At the old 8192 default a
+# Qwen3-class model burned it inside <think> and answered with one line.
+eq("tokens: default is generous enough for a thinking model",
+   R._llm_settings({})["max_tokens"], 60000)
+eq("tokens: a typed value is honoured", R._llm_settings({"llm": {"max_tokens": 32000}})["max_tokens"], 32000)
+eq("tokens: a string from the widget still parses",
+   R._llm_settings({"llm": {"max_tokens": "120000"}})["max_tokens"], 120000)
+eq("tokens: junk falls back rather than sending NaN",
+   R._llm_settings({"llm": {"max_tokens": "lots"}})["max_tokens"], 60000)
+eq("tokens: absurdly small is floored", R._llm_settings({"llm": {"max_tokens": 10}})["max_tokens"], 1024)
+eq("tokens: absurdly large is capped", R._llm_settings({"llm": {"max_tokens": 99999999}})["max_tokens"], 1000000)
+
+_src = (_PACK / "server_routes.py").read_text(encoding="utf-8")
+ok("tokens: the route actually forwards it to call_llm", "max_tokens=cfg[\"max_tokens\"]" in _src)
+_js = (_PACK / "web" / "h3_maker.js").read_text(encoding="utf-8")
+ok("tokens: the dialog offers a field for it", "inputs.max_tokens" in _js)
+ok("tokens: and saves what was typed", 'max_tokens: Number(inputs.max_tokens.value)' in _js)
+
 # --- constants the frontend relies on ---------------------------------------
 eq("prefix matches the app's API_BASE", R.PREFIX + "/api", "/h3_prompt_maker/api")
 ok("body cap is generous enough for inline media", R.MAX_BODY_BYTES >= 32 * 1024 * 1024)

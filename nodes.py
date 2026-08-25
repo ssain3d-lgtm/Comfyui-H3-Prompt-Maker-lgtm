@@ -27,7 +27,14 @@ _LENGTH_RE = re.compile(r"length\s+(\d+)\s*\(\s*(\d+(?:\.\d+)?)\s*s\s*\)", re.IG
 _FENCE_RE = re.compile(r"```[a-zA-Z0-9_-]*\r?\n(.*?)(?:```|\Z)", re.DOTALL)
 _OPEN_FENCE_RE = re.compile(r"```[a-zA-Z0-9_-]*\r?\n")
 # Reasoning models wrap their scratchpad in these; it is not the answer.
-_THINK_RE = re.compile(r"<(think|reasoning)>.*?</\1>", re.DOTALL | re.IGNORECASE)
+_THINK_RE = re.compile(r"<(think|reasoning)>(.*?)</\1>", re.DOTALL | re.IGNORECASE)
+_H3_SECTIONS = ("subject_definitions", "summary", "retention_analysis", "detailed_description",
+                "integrated_multimodal_description", "overall_soundscape", "non_diegetic_music")
+
+
+def _count_sections(text):
+    return sum(1 for name in _H3_SECTIONS
+               if re.search(r"^\s*%s\s*:" % name, text, re.MULTILINE | re.IGNORECASE))
 _SEGMENT_HEADER_RE = re.compile(r"^[ \t]*Prompt\s+\d+\s*[\u2014\u2013-].*$", re.MULTILINE)
 _KOREAN_SEP = "--- KOREAN TRANSLATION ---"
 
@@ -92,7 +99,19 @@ def _parse_llm_output(text, fallback_seconds):
     <think> scratchpads, a length figure mentioned in prose, and multi-segment
     answers whose Korean summaries used to swallow every later segment.
     """
-    text = _THINK_RE.sub("", text or "").strip()
+    # Same recovery as the overlay's parser: a reasoning model that wrote the
+    # whole prompt inside <think> and only a note outside has produced the
+    # answer, just in the wrong place. Discarding the block would throw it away.
+    raw_text = text or ""
+    reasoning = "\n\n".join(m.group(2) for m in _THINK_RE.finditer(raw_text))
+    without_think = _THINK_RE.sub("", raw_text).strip()
+    if _count_sections(without_think) == 0 and _count_sections(reasoning) >= 2:
+        # The length line sits outside the block and drives the frame count, so
+        # carry it across; the note beside it is not part of the prompt.
+        _len = _LENGTH_RE.search(without_think)
+        text = (reasoning.strip() + ("\n" + _len.group(0) if _len else "")).strip()
+    else:
+        text = without_think
 
     headers = list(_SEGMENT_HEADER_RE.finditer(text))
     if len(headers) >= 2:

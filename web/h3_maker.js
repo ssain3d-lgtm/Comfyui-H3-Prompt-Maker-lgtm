@@ -35,6 +35,9 @@ const DEFAULT_LLM = {
   cli_command: "",
   server_model: "(auto)",
   temperature: 0.7,
+  // A reasoning model spends this thinking before it answers; 8192 left a
+  // Qwen3-class model emitting one line of assumptions as its "answer".
+  max_tokens: 60000,
   /** Epoch ms of the last successful 연결 확인, 0 when never checked. */
   verifiedAt: 0,
 };
@@ -320,6 +323,16 @@ const openSettings = async (node) => {
   inputs.temperature = el("input", FIELD_STYLE, { type: "number", step: "0.05", min: "0", max: "2", value: cfg.temperature });
   row("temperature", "temperature", inputs.temperature);
 
+  inputs.max_tokens = el("input", FIELD_STYLE, {
+    type: "number", step: "1024", min: "1024", max: "1000000", value: cfg.max_tokens,
+  });
+  row("max_tokens", "max_tokens", inputs.max_tokens);
+  const tokenHint = el("p", { margin: "-4px 0 0 104px", fontSize: "11px", color: "#8b949e", lineHeight: "1.5" }, {
+    textContent: "응답 상한. 추론 모델은 답하기 전에 이 예산을 생각하는 데 씁니다 — "
+               + "너무 낮으면 본문 없이 한 줄만 돌아옵니다. 기본 60000.",
+  });
+  box.append(tokenHint);
+
   // Only show the fields the chosen backend actually uses — an HTTP server has
   // no CLI command, and a CLI backend has no address or model list.
   const applyBackend = (fillPreset) => {
@@ -437,6 +450,7 @@ const openSettings = async (node) => {
       server_model: inputs.server_model.value,
       model: inputs.server_model.value === "(auto)" ? "" : inputs.server_model.value,
       temperature: Number(inputs.temperature.value) || 0.7,
+      max_tokens: Number(inputs.max_tokens.value) || 60000,
       // Recorded so the node face can distinguish a checked configuration from
       // one that was merely typed in and saved.
       verifiedAt: verified ? Date.now() : 0,
