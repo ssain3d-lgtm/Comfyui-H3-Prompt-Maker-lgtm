@@ -101,6 +101,50 @@ ok("user: remake source is included", "[REMAKE SOURCE PROMPT]" in remake and "ol
 ok("user: no remake block without a source",
    "[REMAKE SOURCE PROMPT]" not in R._build_user_text({"isRemake": True}, 0))
 
+# --- contact sheets: the only way a clip reaches a local model ---------------
+# The OpenAI-compatible chat schema has no video part, so before this an
+# attached clip reached the model as nothing but the note beside it. What
+# travels now is one labelled sheet of its frames, riding along as an image.
+sheet_text = R._build_user_text(body, 2, 1)
+ok("sheet: the model is told the last image is not a still",
+   "not stills" in sheet_text or "contact sheet" in sheet_text, sheet_text[-300:])
+ok("sheet: it is told how many frames and in what order",
+   "left to right and top to bottom" in sheet_text, sheet_text[-300:])
+ok("sheet: it is told to read motion, not describe a grid",
+   "must not appear in the prompt" in sheet_text, sheet_text[-300:])
+ok("sheet: the frame count from the request is quoted",
+   "8 frames" in R._build_user_text(dict(body, videoFrameCount=8), 2, 1))
+eq("sheet: a different frame count is quoted, not the default",
+   "16 frames" in R._build_user_text(dict(body, videoFrameCount=16), 2, 1), True)
+ok("sheet: no sheet block when no clip was attached",
+   "contact sheet" not in R._build_user_text(body, 2, 0))
+ok("sheet: pictures are still described alongside",
+   "<Picture 1> — 얼굴 기준" in sheet_text)
+
+# Where the sheets land in the image list decides whether a third clip can push
+# <Picture 9> out of the request. They go after the pictures, with their own cap.
+_sheet_body = {
+    "imagesBase64": ["P%d" % i for i in range(12)],
+    "videoFramesBase64": ["S1", "S2", "S3", "S4"],
+}
+_imgs = [R._strip_data_url(x) for x in R._collect(_sheet_body, "imageBase64", "imagesBase64")][:9]
+_sheets = [R._strip_data_url(x) for x in R._collect(_sheet_body, "videoFramesBase64")][:3]
+eq("sheet: pictures keep all nine of their slots", _imgs, ["P%d" % i for i in range(9)])
+eq("sheet: sheets are capped at three, like the video slots", _sheets, ["S1", "S2", "S3"])
+eq("sheet: sheets follow the pictures, never displace them",
+   (_imgs + _sheets)[:9], ["P%d" % i for i in range(9)])
+eq("sheet: a data URL prefix is stripped like any other attachment",
+   R._strip_data_url("data:image/jpeg;base64,AAAA"), "AAAA")
+
+# A JPEG sheet labelled image/png works on servers that sniff the bytes and
+# fails on the strict ones — the worst kind of bug to chase.
+B = importlib.import_module("h3pack.llm_backends")
+eq("sheet: a jpeg payload is labelled image/jpeg", B.image_mime("/9j/4AAQSkZJRg"), "image/jpeg")
+eq("sheet: a png payload is still image/png", B.image_mime("iVBORw0KGgoAAAA"), "image/png")
+eq("sheet: webp is recognised", B.image_mime("UklGRiQAAABXRUJQ"), "image/webp")
+eq("sheet: an unknown payload falls back to png rather than failing", B.image_mime("zzzz"), "image/png")
+eq("sheet: a non-string never raises", B.image_mime(None), "image/png")
+
 # --- the trailing slash the relative asset links depend on ------------------
 _html = (R.APP_DIR / "index.html")
 if _html.is_file():

@@ -10,6 +10,7 @@ Two families:
   (Claude Code: `claude -p --output-format text`, Gemini CLI: `gemini -p`, ...)
 """
 
+import base64
 import json
 import os
 import shlex
@@ -119,17 +120,61 @@ def _extract_text(data):
     return text
 
 
+# Base64 of a file's first bytes always starts the same way, so the type can be
+# read off the payload without carrying the data-URL prefix around. Labelling a
+# JPEG contact sheet as image/png works on servers that sniff the bytes and
+# fails on the strict ones, which is the worst kind of bug to chase.
+_MAGIC = (("/9j/", "image/jpeg"), ("iVBORw0KGgo", "image/png"),
+          ("R0lGOD", "image/gif"), ("UklGR", "image/webp"))
+
+
+def image_mime(b64):
+    for prefix, mime in _MAGIC:
+        if isinstance(b64, str) and b64.startswith(prefix):
+            return mime
+    return "image/png"
+
+
+# The chat schema carries audio as a bare base64 payload plus a format name, so
+# the container has to be read off the bytes. Guessing wrong is not harmless:
+# a server handed format "wav" for an mp3 decodes noise and describes it.
+def audio_format(b64):
+    try:
+        chunk = b64[: (len(b64) // 4) * 4][:32]
+        head = base64.b64decode(chunk)
+    except Exception:  # noqa: BLE001 — an undecodable payload is not worth a crash
+        return "wav"
+    if head[:4] == b"RIFF" and head[8:12] == b"WAVE":
+        return "wav"
+    if head[:4] == b"OggS":
+        return "ogg"
+    if head[:4] == b"fLaC":
+        return "flac"
+    if head[4:8] == b"ftyp":
+        return "m4a"
+    if head[:3] == b"ID3" or (len(head) > 1 and head[0] == 0xFF and (head[1] & 0xE0) == 0xE0):
+        return "mp3"
+    return "wav"
+
+
 def call_openai_compatible(base_url, model, api_key, system_prompt, user_text,
                            images_base64=None, temperature=0.7, seed=-1, timeout=600,
-                           max_tokens=DEFAULT_MAX_TOKENS, thinking="auto", unload_after="keep"):
+                           max_tokens=DEFAULT_MAX_TOKENS, thinking="auto", unload_after="keep",
+                           audios_base64=None):
     url = base_url.rstrip("/") + "/chat/completions"
     user_text = apply_thinking(user_text, thinking)
 
-    if images_base64:
+    if images_base64 or audios_base64:
         content = [{"type": "text", "text": user_text}]
-        for b64 in images_base64:
+        for b64 in (images_base64 or []):
             content.append({"type": "image_url",
-                            "image_url": {"url": f"data:image/png;base64,{b64}"}})
+                            "image_url": {"url": f"data:{image_mime(b64)};base64,{b64}"}})
+        # Only an omni model (Qwen2-Audio, Qwen2.5/3-Omni, gpt-4o-audio) has an
+        # audio tower. A text or vision-only model rejects this, and the retry
+        # below drops it — which is the honest outcome, not a silent success.
+        for b64 in (audios_base64 or []):
+            content.append({"type": "input_audio",
+                            "input_audio": {"data": b64, "format": audio_format(b64)}})
     else:
         content = user_text
 
@@ -168,9 +213,23 @@ def call_openai_compatible(base_url, model, api_key, system_prompt, user_text,
             for k in optional:
                 payload.pop(k)
             return _extract_text(post())
-        # Only a vision rejection is worth a second call. Retrying a dead server
-        # or a 401 just doubles the wait (and, on a paid endpoint, the bill).
-        if images_base64 and ("image" in msg or "vision" in msg or "content" in msg or "400" in msg):
+        # Audio is the part most models lack, so it is shed first and alone:
+        # dropping the pictures at the same time would throw away a reference
+        # the model could actually have read.
+        media_rejected = ("image" in msg or "vision" in msg or "audio" in msg
+                          or "content" in msg or "400" in msg)
+        if audios_base64 and media_rejected:
+            payload["messages"][1]["content"] = [
+                part for part in payload["messages"][1]["content"] if part.get("type") != "input_audio"
+            ]
+            try:
+                return _extract_text(post())
+            except LLMError as second:
+                msg = str(second).lower()
+                media_rejected = ("image" in msg or "vision" in msg or "content" in msg or "400" in msg)
+        # Only a vision rejection is worth a further call. Retrying a dead
+        # server or a 401 just doubles the wait (and, on a paid endpoint, the bill).
+        if images_base64 and media_rejected:
             payload["messages"][1]["content"] = user_text
             return _extract_text(post())
         raise
@@ -310,7 +369,7 @@ def resolve_api_key(api_key):
 def call_llm(backend, base_url, model, api_key, cli_command, system_prompt,
              user_text, images_base64=None, temperature=0.7, seed=-1, timeout=600,
              server_model=AUTO_MODEL, max_tokens=DEFAULT_MAX_TOKENS, thinking="auto",
-             unload_after="keep"):
+             unload_after="keep", audios_base64=None):
     kind, url, mdl, cmd = resolve_backend(backend, base_url, model, cli_command, server_model)
     if kind == "cli":
         # A CLI runner has no template switch; the text token is all there is.
@@ -319,7 +378,8 @@ def call_llm(backend, base_url, model, api_key, cli_command, system_prompt,
     return call_openai_compatible(url, mdl, api_key, system_prompt, user_text,
                                   images_base64=images_base64, temperature=temperature,
                                   seed=seed, timeout=timeout, max_tokens=max_tokens,
-                                  thinking=thinking, unload_after=unload_after)
+                                  thinking=thinking, unload_after=unload_after,
+                                  audios_base64=audios_base64)
 
 
 def probe_backend(backend, base_url, api_key, cli_command, timeout=6.0):

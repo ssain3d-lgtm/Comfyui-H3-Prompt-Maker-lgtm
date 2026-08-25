@@ -68,7 +68,7 @@ def _collect(body, *keys):
     return out
 
 
-def _build_user_text(body, image_count):
+def _build_user_text(body, image_count, sheet_count=0, audio_count=0):
     """Same assembly the widget node does, from the overlay's request shape."""
     submode = str(body.get("minimaxStyle") or "ref2va")
     lines = [f"[MINIMAX H3 {submode.upper()} REQUEST]"]
@@ -91,6 +91,28 @@ def _build_user_text(body, image_count):
             role = roles[i].strip() if isinstance(roles, list) and i < len(roles) and isinstance(roles[i], str) else ""
             described.append(f"<Picture {i + 1}>" + (f" — {role}" if role else ""))
         lines.append("Reference pictures supplied: " + ", ".join(described))
+
+    if sheet_count:
+        n = int(body.get("videoFrameCount") or 8)
+        lines.append(
+            f"Attached after the reference pictures are {sheet_count} contact sheet(s), one per "
+            f"reference clip: <Video 1> ... <Video {sheet_count}>, in that order. Each sheet tiles "
+            f"{n} frames sampled evenly across that clip, left to right and top to bottom, with the "
+            f"frame number and its timestamp printed under each cell. Read them as one moving shot, "
+            f"not as separate stills: the change between cells is the camera path, the subject's "
+            f"motion arc and the pacing. Describe what moves and how, never the grid itself — the "
+            f"words 'contact sheet', 'grid', 'tile' and 'frame number' must not appear in the prompt."
+        )
+
+    if audio_count:
+        lines.append(
+            f"{audio_count} reference audio clip(s) are attached: <Audio 1> ... <Audio {audio_count}>. "
+            f"If you can hear them, let what you hear drive overall_soundscape and non_diegetic_music, "
+            f"and give each one a documented marker (fully_copy | partially_copy | reference | "
+            f"weak_reference) in retention_analysis. If you cannot hear audio at all, say nothing "
+            f"about these clips and write the soundscape from the scene and the note below instead — "
+            f"never invent what a clip you did not hear contains."
+        )
 
     for label, key in (("Video", "videoRefNote"), ("Audio", "audioRefNote")):
         note = str(body.get(key) or "").strip()
@@ -233,10 +255,21 @@ def register(routes):
 
         images = [_strip_data_url(x) for x in _collect(body, "imageBase64", "imagesBase64")]
         images = [x for x in images if x][:9]
-        user_text = _build_user_text(body, len(images))
+        # The OpenAI-compatible chat schema every local backend speaks has no
+        # video part, so a clip arrives as one contact sheet of its frames and
+        # rides along as an ordinary image. Sheets go after the pictures and
+        # keep their own cap, so a third clip can never push out <Picture 9>.
+        sheets = [_strip_data_url(x) for x in _collect(body, "videoFramesBase64")]
+        sheets = [x for x in sheets if x][:3]
+        # Audio only lands anywhere on an omni model (Qwen2-Audio, Qwen2.5/3-Omni).
+        # Sending it regardless is right: the call sheds it on rejection, so a
+        # text model behaves exactly as before while an omni model gains the clip.
+        audios = [_strip_data_url(x) for x in _collect(body, "audioBase64", "audiosBase64")]
+        audios = [x for x in audios if x][:3]
+        user_text = _build_user_text(body, len(images), len(sheets), len(audios))
         cfg = _llm_settings(body)
         # A CLI backend takes stdin only, so pictures cannot travel with it.
-        send_images = images if not cfg["backend"].endswith("_cli") else []
+        send_images = (images + sheets) if not cfg["backend"].endswith("_cli") else []
 
         try:
             text = call_llm(
@@ -245,6 +278,7 @@ def register(routes):
                 temperature=cfg["temperature"], server_model=cfg["server_model"],
                 max_tokens=cfg["max_tokens"], thinking=cfg["thinking"],
                 unload_after=cfg["unload_after"],
+                audios_base64=audios if not cfg["backend"].endswith("_cli") else None,
             )
         except LLMError as exc:
             return _json({"error": str(exc), "reason": "transient"}, status=502)
