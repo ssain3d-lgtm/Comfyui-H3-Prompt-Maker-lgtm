@@ -124,6 +124,24 @@ def _llm_settings(body):
     }
 
 
+async def _read_body(request, limit=MAX_BODY_BYTES):
+    """Read the entire request payload, bounded. None when it exceeds `limit`.
+
+    Not request.content.read(limit): that is a StreamReader read, which returns
+    whatever happens to be buffered — up to n, and routinely far less. A body
+    carrying a base64 image arrives across many chunks, so that call handed back
+    the first fragment and json.loads reported an unterminated string at around
+    column 292. Every generation with an attachment failed that way.
+    """
+    chunks, total = [], 0
+    async for chunk in request.content.iter_chunked(1 << 16):
+        total += len(chunk)
+        if total > limit:
+            return None
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 def register(routes):
     @routes.get(PREFIX + "/api/health")
     async def health(request):
@@ -170,8 +188,8 @@ def register(routes):
     @routes.post(PREFIX + "/api/generate-prompt")
     async def generate_prompt(request):
         try:
-            raw = await request.content.read(MAX_BODY_BYTES + 1)
-            if len(raw) > MAX_BODY_BYTES:
+            raw = await _read_body(request)
+            if raw is None:
                 return _json({"error": "요청이 너무 큽니다 (64MB 초과)."}, status=413)
             body = json.loads(raw.decode("utf-8", errors="replace"))
             if not isinstance(body, dict):

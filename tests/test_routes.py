@@ -8,6 +8,7 @@ request translation that decides what the LLM is actually asked.
 """
 
 import importlib.util
+import json
 import pathlib
 import sys
 
@@ -112,6 +113,65 @@ ok("iframe src keeps the trailing slash — without it every ./asset resolves on
    "${PREFIX}/app/`" in _js, [l for l in _js.splitlines() if "frame.src" in l])
 ok("bare /app redirects instead of serving", "HTTPMovedPermanently" in
    (_PACK / "server_routes.py").read_text(encoding="utf-8"))
+
+# --- reading the request body -----------------------------------------------
+# A body carrying a base64 image does not arrive in one piece. aiohttp's
+# StreamReader.read(n) hands back only what is buffered, so reading that way
+# truncated the JSON and every generation with an attachment came back
+# "잘못된 요청입니다: Unterminated string". These fakes reproduce that split.
+import asyncio
+
+
+class _FakeStream:
+    """Mimics aiohttp's StreamReader for the two ways of draining it."""
+
+    def __init__(self, payload, chunk=64):
+        self._pieces = [payload[i:i + chunk] for i in range(0, len(payload), chunk)] or [b""]
+
+    def iter_chunked(self, _n):
+        pieces = list(self._pieces)
+
+        class _It:
+            def __aiter__(self_inner):
+                return self_inner
+
+            async def __anext__(self_inner):
+                if not pieces:
+                    raise StopAsyncIteration
+                return pieces.pop(0)
+
+        return _It()
+
+    async def read(self, _n=-1):
+        # The behaviour that caused the bug: one buffered piece, not the lot.
+        return self._pieces[0]
+
+
+class _FakeRequest:
+    def __init__(self, payload, chunk=64):
+        self.content = _FakeStream(payload, chunk)
+
+
+_payload = json.dumps({
+    "promptText": "골목을 걷는 인물",
+    "imagesBase64": ["data:image/png;base64," + "A" * 5000],
+}).encode()
+
+_whole = asyncio.new_event_loop().run_until_complete(R._read_body(_FakeRequest(_payload)))
+eq("body: reads every chunk, not just the buffered one", len(_whole), len(_payload))
+ok("body: the JSON parses after a chunked read", json.loads(_whole.decode())["promptText"] == "골목을 걷는 인물")
+ok("body: a single-chunk read would have truncated it — the bug is real",
+   len(asyncio.new_event_loop().run_until_complete(_FakeRequest(_payload).content.read(len(_payload)))) < len(_payload))
+
+_small = asyncio.new_event_loop().run_until_complete(
+    R._read_body(_FakeRequest(b'{"a":1}'), limit=R.MAX_BODY_BYTES))
+eq("body: a tiny body still round-trips", json.loads(_small.decode()), {"a": 1})
+
+_over = asyncio.new_event_loop().run_until_complete(R._read_body(_FakeRequest(b"x" * 5000), limit=1000))
+eq("body: over the cap returns None rather than a partial parse", _over, None)
+
+_empty = asyncio.new_event_loop().run_until_complete(R._read_body(_FakeRequest(b"")))
+eq("body: an empty body is empty, not an error", _empty, b"")
 
 # --- constants the frontend relies on ---------------------------------------
 eq("prefix matches the app's API_BASE", R.PREFIX + "/api", "/h3_prompt_maker/api")
