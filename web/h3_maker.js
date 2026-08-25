@@ -89,13 +89,25 @@ const describeConn = (llm) => {
   return { text: `${verified}${cfg.backend} · ${model}`, ok: Boolean(cfg.verifiedAt) };
 };
 
-/** A widget the user must not edit by hand still has to serialize, so it keeps
- *  its value and loses only its drawing and its height. */
+/**
+ * A widget the user must not edit by hand still has to serialize, so it keeps
+ * its value and loses only its drawing and its height.
+ *
+ * Zeroing computeSize is enough for a canvas-drawn widget but NOT for a
+ * DOM-backed one: ComfyUI positions those elements itself and only skips the
+ * type names it knows, so a custom type left the element on screen. The node no
+ * longer asks for multiline (see nodes.py), but a workflow saved against the
+ * older node still carries one, so the element is hidden explicitly here.
+ */
 const hideWidget = (w) => {
-  w.type = "h3hidden";
+  w.type = "converted-widget";   // the name ComfyUI's own layout skips
   w.computeSize = () => [0, -4];
+  w.computedHeight = 0;
   w.draw = () => {};
   w.onDrawBackground = () => {};
+  w.options = { ...(w.options || {}), hidden: true };
+  const el = w.element || w.inputEl;
+  if (el && el.style) { el.style.display = "none"; el.hidden = true; }
 };
 
 // ---------------------------------------------------------------------------

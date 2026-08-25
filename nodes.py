@@ -411,7 +411,13 @@ class H3PromptMakerUI:
 
     @classmethod
     def INPUT_TYPES(cls):
-        hidden_str = lambda: ("STRING", {"default": "", "multiline": True})
+        # NOT multiline: ComfyUI backs a multiline STRING with a real DOM
+        # textarea, and a DOM element is not hidden by the canvas-side tricks
+        # the extension uses — one of these three was being rendered on the
+        # node as a stray input box. A plain STRING is drawn on the canvas and
+        # disappears completely when its height is zeroed. Nobody types in
+        # these; the extension writes JSON into them.
+        hidden_str = lambda: ("STRING", {"default": ""})
         return {
             "required": {
                 # Filled by the overlay; the canvas never shows them.
