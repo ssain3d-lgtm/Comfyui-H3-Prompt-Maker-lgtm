@@ -18,7 +18,7 @@ import traceback
 from .h3_prompts import build_system_prompt, nearest_grid_frames
 from .llm_backends import (
     AUTO_MODEL, BACKEND_NAMES, LLMError, PRESET_BASE_URLS, PRESET_CLI_COMMANDS,
-    call_llm, discover_local_models, normalize_backend,
+    call_llm, discover_local_models, normalize_backend, probe_backend, warm_up_model,
 )
 
 PREFIX = "/h3_prompt_maker"
@@ -137,6 +137,29 @@ def register(routes):
             "preset_cli_commands": PRESET_CLI_COMMANDS,
             "models": discover_local_models(),
         })
+
+    @routes.post(PREFIX + "/api/probe")
+    async def probe(request):
+        """Reachability check for the settings dialog's 연결 확인 button."""
+        try:
+            body = json.loads(await request.text() or "{}")
+        except ValueError:
+            body = {}
+        cfg = _llm_settings({"llm": body})
+        return _json(probe_backend(cfg["backend"], cfg["base_url"], cfg["api_key"], cfg["cli_command"]))
+
+    @routes.post(PREFIX + "/api/load-model")
+    async def load_model(request):
+        """Ask the server to page the chosen model into memory before it is needed."""
+        try:
+            body = json.loads(await request.text() or "{}")
+        except ValueError:
+            body = {}
+        cfg = _llm_settings({"llm": body})
+        model = str(body.get("model") or "").strip()
+        if cfg["backend"].endswith("_cli"):
+            return _json({"ok": True, "detail": "CLI 백엔드는 미리 로드할 모델이 없습니다."})
+        return _json(warm_up_model(cfg["backend"], cfg["base_url"], cfg["api_key"], model))
 
     @routes.post(PREFIX + "/api/edit-image")
     async def edit_image(request):

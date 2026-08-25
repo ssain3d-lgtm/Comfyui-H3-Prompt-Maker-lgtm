@@ -13,6 +13,20 @@ const NODE = "H3PromptMakerUI";
 const PREFIX = "/h3_prompt_maker";
 const HIDDEN = ["state", "llm", "result"];
 
+const DEFAULT_PRESETS = {
+  base: {
+    lmstudio: "http://127.0.0.1:1234/v1",
+    ollama: "http://127.0.0.1:11434/v1",
+    llamacpp: "http://127.0.0.1:8080/v1",
+    vllm: "http://127.0.0.1:8000/v1",
+  },
+  cli: {
+    claude_cli: "claude -p --output-format text",
+    gemini_cli: "gemini -p",
+    codex_cli: "codex exec",
+  },
+};
+
 const DEFAULT_LLM = {
   backend: "lmstudio",
   base_url: "",
@@ -21,6 +35,8 @@ const DEFAULT_LLM = {
   cli_command: "",
   server_model: "(auto)",
   temperature: 0.7,
+  /** Epoch ms of the last successful 연결 확인, 0 when never checked. */
+  verifiedAt: 0,
 };
 
 const parse = (raw, fallback) => {
@@ -33,6 +49,36 @@ const readJson = (node, name, fallback) => parse(widget(node, name)?.value ?? ""
 const writeJson = (node, name, value) => {
   const w = widget(node, name);
   if (w) w.value = JSON.stringify(value);
+};
+
+/** Room reserved under the widgets for the two status lines drawn by hand. */
+const FOOTER_H = 40;
+
+/** An invisible widget of fixed height — the only way to put air between two
+ *  LiteGraph buttons, which are otherwise laid out flush. */
+const spacer = (node, height) => {
+  const w = node.addWidget("text", "", "", () => {});
+  w.type = "h3spacer";
+  w.computeSize = () => [0, height];
+  w.draw = () => {};
+  w.serialize = false;
+  return w;
+};
+
+const resize = (node) => {
+  const [w, h] = node.computeSize();
+  node.size[0] = Math.max(w, 290);
+  node.size[1] = h + FOOTER_H;
+  node.setDirtyCanvas(true, true);
+};
+
+/** One line describing where generation will go, for the node face. */
+const describeConn = (llm) => {
+  const cfg = { ...DEFAULT_LLM, ...(llm || {}) };
+  if (!llm || Object.keys(llm).length === 0) return { text: "모델 미설정", ok: false };
+  const model = cfg.server_model && cfg.server_model !== "(auto)" ? cfg.server_model : (cfg.model || "(auto)");
+  const verified = cfg.verifiedAt ? "● " : "○ ";
+  return { text: `${verified}${cfg.backend} · ${model}`, ok: Boolean(cfg.verifiedAt) };
 };
 
 /** A widget the user must not edit by hand still has to serialize, so it keeps
@@ -156,126 +202,237 @@ const summarize = (r) => {
 // Settings dialog — the only thing the node itself configures
 // ---------------------------------------------------------------------------
 
-const FIELDS = [
-  ["backend", "백엔드", "select"],
-  ["server_model", "감지된 모델", "select-models"],
-  ["model", "모델 이름", "text"],
-  ["base_url", "base_url", "text"],
-  ["api_key", "API 키", "password"],
-  ["cli_command", "CLI 명령", "text"],
-  ["temperature", "temperature", "number"],
-];
+const el = (tag, style, props = {}) => {
+  const n = Object.assign(document.createElement(tag), props);
+  Object.assign(n.style, style);
+  return n;
+};
+
+const FIELD_STYLE = {
+  background: "#0d1117", border: "1px solid #30363d", borderRadius: "6px",
+  color: "#e6edf3", padding: "5px 8px", font: "inherit", width: "100%",
+};
+
+const button = (text, kind) => {
+  const b = el("button", {
+    padding: "6px 14px", borderRadius: "6px", cursor: "pointer",
+    font: "600 12px/1 inherit", whiteSpace: "nowrap",
+    border: kind === "primary" ? "0" : "1px solid #30363d",
+    background: kind === "primary" ? "#4f46e5" : "transparent",
+    color: kind === "primary" ? "#fff" : "#c9d1d9",
+  }, { textContent: text, type: "button" });
+  return b;
+};
 
 const openSettings = async (node) => {
   const cfg = { ...DEFAULT_LLM, ...readJson(node, "llm", {}) };
-  let meta = { backends: ["lmstudio"], preset_base_urls: {}, preset_cli_commands: {}, models: [] };
+  let meta = { backends: [...Object.keys(DEFAULT_PRESETS.base), "openai_compat", "claude_cli", "custom_cli"],
+               preset_base_urls: DEFAULT_PRESETS.base, preset_cli_commands: DEFAULT_PRESETS.cli, models: [] };
   try {
     const res = await fetch(`${PREFIX}/api/backends`);
     if (res.ok) meta = await res.json();
-  } catch { /* offline: the presets below still let the user type an address */ }
+  } catch { /* offline: the presets still let the user type an address */ }
 
-  const back = document.createElement("div");
-  Object.assign(back.style, {
+  const back = el("div", {
     position: "fixed", inset: "0", zIndex: "1300", display: "flex",
     alignItems: "center", justifyContent: "center", background: "rgba(0,0,0,0.6)",
   });
-  const box = document.createElement("div");
-  Object.assign(box.style, {
-    width: "min(460px, 92vw)", background: "#161b22", border: "1px solid #30363d",
+  const box = el("div", {
+    width: "min(520px, 94vw)", background: "#161b22", border: "1px solid #30363d",
     borderRadius: "12px", padding: "18px", color: "#c9d1d9",
     font: "13px/1.5 ui-sans-serif, system-ui, sans-serif",
     display: "flex", flexDirection: "column", gap: "10px",
   });
-  const h = document.createElement("div");
-  h.textContent = "⚙️ 모델 연결";
-  h.style.font = "700 14px/1 inherit";
-  box.append(h);
+  box.append(el("div", { font: "700 14px/1 inherit" }, { textContent: "⚙️ 모델 연결" }));
 
   const inputs = {};
-  for (const [key, label, kind] of FIELDS) {
-    const row = document.createElement("label");
-    Object.assign(row.style, { display: "grid", gridTemplateColumns: "108px 1fr", alignItems: "center", gap: "8px" });
-    const name = document.createElement("span");
-    name.textContent = label;
-    name.style.fontSize = "12px";
-    name.style.color = "#8b949e";
-
-    let field;
-    if (kind === "select" || kind === "select-models") {
-      field = document.createElement("select");
-      const opts = kind === "select" ? meta.backends : ["(auto)", ...(meta.models || [])];
-      for (const o of opts) {
-        const el = document.createElement("option");
-        el.value = o; el.textContent = o;
-        field.append(el);
-      }
-      if (!opts.includes(cfg[key])) {
-        const el = document.createElement("option");
-        el.value = cfg[key]; el.textContent = cfg[key] + " (저장된 값)";
-        field.append(el);
-      }
-    } else {
-      field = document.createElement("input");
-      field.type = kind === "password" ? "password" : kind === "number" ? "number" : "text";
-      if (kind === "number") { field.step = "0.05"; field.min = "0"; field.max = "2"; }
-    }
-    field.value = cfg[key] ?? "";
-    Object.assign(field.style, {
-      background: "#0d1117", border: "1px solid #30363d", borderRadius: "6px",
-      color: "#e6edf3", padding: "5px 8px", font: "inherit", width: "100%",
-    });
-    inputs[key] = field;
-    row.append(name, field);
-    box.append(row);
-  }
-
-  // Picking a preset backend should fill the address it implies, but never
-  // overwrite an address the user typed for openai_compat.
-  inputs.backend.onchange = () => {
-    const b = inputs.backend.value;
-    const url = meta.preset_base_urls?.[b];
-    if (url) inputs.base_url.value = url;
-    const cmd = meta.preset_cli_commands?.[b];
-    if (cmd) inputs.cli_command.value = cmd;
+  const rows = {};
+  const row = (key, label, node2) => {
+    const r = el("label", { display: "grid", gridTemplateColumns: "96px 1fr", alignItems: "center", gap: "8px" });
+    r.append(el("span", { fontSize: "12px", color: "#8b949e" }, { textContent: label }), node2);
+    rows[key] = r;
+    box.append(r);
+    return r;
   };
 
-  const hint = document.createElement("p");
+  inputs.backend = el("select", FIELD_STYLE);
+  for (const b of meta.backends) inputs.backend.append(new Option(b, b));
+  inputs.backend.value = cfg.backend;
+  row("backend", "백엔드", inputs.backend);
+
+  inputs.base_url = el("input", FIELD_STYLE, { type: "text", value: cfg.base_url });
+  row("base_url", "base_url", inputs.base_url);
+
+  inputs.api_key = el("input", FIELD_STYLE, { type: "password", value: cfg.api_key });
+  row("api_key", "API 키", inputs.api_key);
+
+  inputs.cli_command = el("input", FIELD_STYLE, { type: "text", value: cfg.cli_command });
+  row("cli_command", "CLI 명령", inputs.cli_command);
+
+  // --- connect ---------------------------------------------------------
+  const connectRow = el("div", { display: "flex", alignItems: "center", gap: "10px", marginTop: "2px" });
+  const connectBtn = button("🔌 연결 확인", "primary");
+  const statusText = el("span", { fontSize: "12px", color: "#8b949e", flex: "1", minWidth: "0" },
+                        { textContent: cfg.verifiedAt ? "● 이전에 연결 확인됨" : "아직 확인하지 않음" });
+  if (cfg.verifiedAt) statusText.style.color = "#34d399";
+  connectRow.append(connectBtn, statusText);
+  box.append(connectRow);
+
+  // --- model, populated by connecting -----------------------------------
+  const modelWrap = el("div", { display: "flex", gap: "6px" });
+  inputs.server_model = el("select", FIELD_STYLE);
+  const loadBtn = button("모델 로드", "ghost");
+  loadBtn.disabled = true;
+  loadBtn.style.opacity = "0.5";
+  modelWrap.append(inputs.server_model, loadBtn);
+  row("server_model", "모델", modelWrap);
+
+  const fillModels = (models) => {
+    inputs.server_model.textContent = "";
+    inputs.server_model.append(new Option("(auto)", "(auto)"));
+    for (const m of models) inputs.server_model.append(new Option(m, m));
+    const saved = cfg.server_model && cfg.server_model !== "(auto)" ? cfg.server_model : cfg.model;
+    if (saved && !models.includes(saved)) inputs.server_model.append(new Option(`${saved} (저장된 값)`, saved));
+    inputs.server_model.value = saved || "(auto)";
+  };
+  fillModels(meta.models || []);
+
+  inputs.temperature = el("input", FIELD_STYLE, { type: "number", step: "0.05", min: "0", max: "2", value: cfg.temperature });
+  row("temperature", "temperature", inputs.temperature);
+
+  // Only show the fields the chosen backend actually uses — an HTTP server has
+  // no CLI command, and a CLI backend has no address or model list.
+  const applyBackend = (fillPreset) => {
+    const b = inputs.backend.value;
+    const isCli = b.endsWith("_cli");
+    if (fillPreset) {
+      const url = meta.preset_base_urls?.[b];
+      if (url) inputs.base_url.value = url;
+      const cmd = meta.preset_cli_commands?.[b];
+      if (cmd) inputs.cli_command.value = cmd;
+    }
+    rows.base_url.style.display = isCli ? "none" : "grid";
+    rows.api_key.style.display = isCli ? "none" : "grid";
+    rows.cli_command.style.display = isCli ? "grid" : "none";
+    rows.server_model.style.display = isCli ? "none" : "grid";
+    setUnverified("백엔드가 바뀌었습니다 — 연결을 다시 확인하세요.");
+  };
+
+  let verified = Boolean(cfg.verifiedAt);
+  const setUnverified = (why) => {
+    verified = false;
+    loadBtn.disabled = true;
+    loadBtn.style.opacity = "0.5";
+    statusText.style.color = "#8b949e";
+    statusText.textContent = why;
+  };
+  for (const key of ["base_url", "api_key", "cli_command"]) {
+    inputs[key].addEventListener("input", () => setUnverified("설정이 바뀌었습니다 — 연결을 다시 확인하세요."));
+  }
+  inputs.backend.onchange = () => applyBackend(true);
+
+  connectBtn.onclick = async () => {
+    connectBtn.disabled = true;
+    statusText.style.color = "#8b949e";
+    statusText.textContent = "연결 확인 중…";
+    try {
+      const res = await fetch(`${PREFIX}/api/probe`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          backend: inputs.backend.value, base_url: inputs.base_url.value,
+          api_key: inputs.api_key.value, cli_command: inputs.cli_command.value,
+        }),
+      });
+      const r = await res.json();
+      if (r.ok) {
+        verified = true;
+        statusText.style.color = "#34d399";
+        statusText.textContent = `● 연결됨 — ${r.detail}`;
+        if (r.kind === "http") {
+          fillModels(r.models || []);
+          loadBtn.disabled = false;
+          loadBtn.style.opacity = "1";
+        }
+      } else {
+        setUnverified("");
+        statusText.style.color = "#f87171";
+        statusText.textContent = `✗ ${r.detail}`;
+      }
+    } catch (e) {
+      setUnverified("");
+      statusText.style.color = "#f87171";
+      statusText.textContent = `✗ 확인 실패: ${e.message}`;
+    } finally {
+      connectBtn.disabled = false;
+    }
+  };
+
+  loadBtn.onclick = async () => {
+    const model = inputs.server_model.value;
+    if (!model || model === "(auto)") {
+      statusText.style.color = "#fb923c";
+      statusText.textContent = "로드할 모델을 목록에서 고르세요 ((auto)는 로드 대상이 없습니다).";
+      return;
+    }
+    loadBtn.disabled = true;
+    statusText.style.color = "#8b949e";
+    // Loading a large model off disk is slow; saying so beats a frozen dialog.
+    statusText.textContent = `${model} 로드 중… (모델 크기에 따라 수십 초 걸릴 수 있습니다)`;
+    try {
+      const res = await fetch(`${PREFIX}/api/load-model`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          backend: inputs.backend.value, base_url: inputs.base_url.value,
+          api_key: inputs.api_key.value, model,
+        }),
+      });
+      const r = await res.json();
+      statusText.style.color = r.ok ? "#34d399" : "#f87171";
+      statusText.textContent = (r.ok ? "● " : "✗ ") + r.detail;
+    } catch (e) {
+      statusText.style.color = "#f87171";
+      statusText.textContent = `✗ 로드 실패: ${e.message}`;
+    } finally {
+      loadBtn.disabled = false;
+    }
+  };
+
+  applyBackend(false);
+
+  const hint = el("p", { margin: "2px 0 0", fontSize: "11px", color: "#8b949e", lineHeight: "1.5" });
   hint.innerHTML = "위젯에 입력한 키는 <b>워크플로우 JSON과 그 워크플로우로 만든 PNG 메타데이터에 저장</b>됩니다. " +
                    "공유할 계획이면 비워 두고 환경변수를 쓰세요.";
-  Object.assign(hint.style, { margin: "2px 0 0", fontSize: "11px", color: "#8b949e", lineHeight: "1.5" });
   box.append(hint);
 
-  const row = document.createElement("div");
-  Object.assign(row.style, { display: "flex", justifyContent: "flex-end", gap: "8px", marginTop: "4px" });
-  const mk = (text, primary) => {
-    const b = document.createElement("button");
-    b.textContent = text;
-    Object.assign(b.style, {
-      padding: "6px 14px", borderRadius: "6px", cursor: "pointer", font: "600 12px/1 inherit",
-      border: primary ? "0" : "1px solid #30363d",
-      background: primary ? "#4f46e5" : "transparent",
-      color: primary ? "#fff" : "#c9d1d9",
-    });
-    return b;
-  };
-  const cancel = mk("취소", false);
-  const save = mk("저장", true);
+  const footer = el("div", { display: "flex", justifyContent: "flex-end", gap: "8px", marginTop: "4px" });
+  const cancel = button("취소", "ghost");
+  const save = button("저장", "primary");
   cancel.onclick = () => back.remove();
   save.onclick = () => {
-    const next = {};
-    for (const [key] of FIELDS) next[key] = inputs[key].value;
-    next.temperature = Number(next.temperature) || 0.7;
+    const next = {
+      backend: inputs.backend.value,
+      base_url: inputs.base_url.value,
+      api_key: inputs.api_key.value,
+      cli_command: inputs.cli_command.value,
+      server_model: inputs.server_model.value,
+      model: inputs.server_model.value === "(auto)" ? "" : inputs.server_model.value,
+      temperature: Number(inputs.temperature.value) || 0.7,
+      // Recorded so the node face can distinguish a checked configuration from
+      // one that was merely typed in and saved.
+      verifiedAt: verified ? Date.now() : 0,
+    };
     writeJson(node, "llm", next);
+    node.h3Conn = describeConn(next);
     if (overlayNode === node) sendToOverlay("llm", next);
     node.setDirtyCanvas(true, true);
     back.remove();
   };
-  row.append(cancel, save);
-  box.append(row);
+  footer.append(cancel, save);
+  box.append(footer);
   back.append(box);
   back.onclick = (e) => { if (e.target === back) back.remove(); };
   document.body.append(back);
-  inputs.backend.focus();
+  connectBtn.focus();
 };
 
 // ---------------------------------------------------------------------------
@@ -292,11 +449,21 @@ app.registerExtension({
         const w = widget(this, name);
         if (w) hideWidget(w);
       }
-      this.addWidget("button", "🎬 프롬프트 메이커 열기", null, () => openOverlay(this));
-      this.addWidget("button", "⚙️ 모델 연결", null, () => openSettings(this));
+      const open = this.addWidget("button", "🎬 프롬프트 메이커 열기", null, () => openOverlay(this));
+      const conn = this.addWidget("button", "⚙️ 모델 연결", null, () => openSettings(this));
+      // LiteGraph stacks button widgets flush against each other; a primary
+      // action and a settings button reading as one control is what made the
+      // node look unfinished. A spacer widget is the only way to separate them
+      // without patching LiteGraph's layout.
+      spacer(this, 6);
+      // Reorder so the spacer sits between the two buttons rather than after.
+      const ws = this.widgets;
+      ws.splice(ws.indexOf(conn), 1);
+      ws.push(conn);
+
       this.h3Status = summarize(readJson(this, "result", {}));
-      this.size = this.computeSize();
-      this.size[0] = Math.max(this.size[0], 260);
+      this.h3Conn = describeConn(readJson(this, "llm", {}));
+      resize(this);
       return r;
     };
 
@@ -308,8 +475,15 @@ app.registerExtension({
       if (this.flags?.collapsed) return;
       ctx.save();
       ctx.font = "11px ui-sans-serif, system-ui, sans-serif";
-      ctx.fillStyle = this.h3Status?.startsWith("✓") ? "#34d399" : "#8b949e";
-      ctx.fillText(this.h3Status || "적용된 프롬프트 없음", 12, this.size[1] - 8);
+
+      // Connection first, then what is loaded: the order you need them in.
+      const conn = this.h3Conn || { text: "모델 미설정", ok: false };
+      ctx.fillStyle = conn.ok ? "#34d399" : "#8b949e";
+      ctx.fillText(conn.text, 12, this.size[1] - FOOTER_H + 14);
+
+      const status = this.h3Status || "적용된 프롬프트 없음";
+      ctx.fillStyle = status.startsWith("✓") ? "#34d399" : "#8b949e";
+      ctx.fillText(status, 12, this.size[1] - FOOTER_H + 31);
       ctx.restore();
     };
 
@@ -317,6 +491,8 @@ app.registerExtension({
     nodeType.prototype.onConfigure = function () {
       const r = onConfigure?.apply(this, arguments);
       this.h3Status = summarize(readJson(this, "result", {}));
+      this.h3Conn = describeConn(readJson(this, "llm", {}));
+      resize(this);
       return r;
     };
   },

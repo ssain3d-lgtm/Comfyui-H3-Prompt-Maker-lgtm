@@ -225,3 +225,89 @@ def call_llm(backend, base_url, model, api_key, cli_command, system_prompt,
     return call_openai_compatible(url, mdl, api_key, system_prompt, user_text,
                                   images_base64=images_base64, temperature=temperature,
                                   seed=seed, timeout=timeout, max_tokens=max_tokens)
+
+
+def probe_backend(backend, base_url, api_key, cli_command, timeout=6.0):
+    """Answer one question: can this configuration actually be reached?
+
+    The settings dialog used to save an address and find out at generate time,
+    which is the worst moment — the failure arrives as a fallback template. This
+    is the same resolution path a real call takes, so a green result here means
+    the next generation reaches the same place.
+
+    Returns {ok, kind, detail, models, target}. Never raises.
+    """
+    try:
+        kind, url, _mdl, cmd = resolve_backend(backend, base_url, "", cli_command)
+    except LLMError as exc:
+        return {"ok": False, "kind": "", "detail": str(exc), "models": [], "target": ""}
+
+    if kind == "cli":
+        import shutil
+        try:
+            exe = shlex.split(cmd)[0]
+        except ValueError as exc:
+            return {"ok": False, "kind": "cli", "detail": f"명령을 해석할 수 없습니다: {exc}",
+                    "models": [], "target": cmd}
+        found = shutil.which(exe)
+        if not found:
+            return {"ok": False, "kind": "cli", "models": [], "target": cmd,
+                    "detail": f"'{exe}' 실행 파일을 PATH에서 찾지 못했습니다. "
+                              f"ComfyUI를 실행한 셸에서 '{exe}'가 동작하는지 확인하세요."}
+        # A CLI backend has no model list to offer — the subscription decides.
+        return {"ok": True, "kind": "cli", "models": [], "target": cmd,
+                "detail": f"{exe} 확인됨 ({found})"}
+
+    endpoint = url.rstrip("/") + "/models"
+    req = urllib.request.Request(endpoint)
+    key = resolve_api_key(api_key)
+    if key:
+        req.add_header("Authorization", f"Bearer {key}")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as res:
+            payload = json.loads(res.read().decode("utf-8", errors="replace"))
+    except urllib.error.HTTPError as exc:
+        hint = " API 키를 확인하세요." if exc.code in (401, 403) else ""
+        return {"ok": False, "kind": "http", "models": [], "target": url,
+                "detail": f"HTTP {exc.code} {exc.reason}.{hint}"}
+    except Exception as exc:
+        return {"ok": False, "kind": "http", "models": [], "target": url,
+                "detail": f"{url} 에 연결하지 못했습니다 ({type(exc).__name__}). "
+                          f"서버가 켜져 있고 주소가 맞는지 확인하세요."}
+
+    models = []
+    for m in (payload.get("data") or []):
+        mid = m.get("id") if isinstance(m, dict) else None
+        if mid and mid not in models:
+            models.append(mid)
+    return {"ok": True, "kind": "http", "models": models, "target": url,
+            "detail": f"모델 {len(models)}개 확인됨"}
+
+
+def warm_up_model(backend, base_url, api_key, model, timeout=180.0):
+    """Make the server load `model` into memory now, rather than mid-generation.
+
+    LM Studio, Ollama and vLLM all load a model lazily on its first request, so
+    the first real prompt otherwise pays a stall long enough to look like a
+    hang. A one-token completion is the portable way to trigger that — there is
+    no load endpoint the four backends share.
+
+    Returns {ok, detail}. Never raises.
+    """
+    if not model:
+        return {"ok": False, "detail": "로드할 모델을 먼저 선택하세요."}
+    try:
+        _kind, url, _m, _c = resolve_backend(backend, base_url, model, "")
+    except LLMError as exc:
+        return {"ok": False, "detail": str(exc)}
+    body = {
+        "model": model,
+        "messages": [{"role": "user", "content": "ping"}],
+        "max_tokens": 1,
+        "temperature": 0,
+    }
+    try:
+        _post_json(url.rstrip("/") + "/chat/completions", body, resolve_api_key(api_key), timeout)
+    except Exception as exc:
+        return {"ok": False, "detail": f"{model} 로드 실패: {exc}"}
+    return {"ok": True, "detail": f"{model} 메모리에 로드됨"}
