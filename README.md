@@ -159,6 +159,7 @@ python3 tools/sync_app.py /path/to/minimax-h3-prompt-maker-google-studio-ai-v3
 ```bash
 python3 tests/test_parse.py     # 출력 파서 회귀 (INT 출력이 H3 샘플러로 직결됨)
 python3 tests/test_routes.py    # 오버레이 HTTP 계층 — 경로 탈출 차단, 요청 번역
+python3 tests/test_system_prompt.py  # H3 시스템 프롬프트가 실제 요청에 실리는지 (가짜 LLM 서버로 본문 캡처)
 python3 tools/check_bundle.py   # 커밋된 번들이 서빙 가능하고 외부 참조가 없는지
 ```
 

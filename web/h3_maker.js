@@ -54,15 +54,23 @@ const writeJson = (node, name, value) => {
 /** Room reserved under the widgets for the two status lines drawn by hand. */
 const FOOTER_H = 40;
 
-/** An invisible widget of fixed height — the only way to put air between two
- *  LiteGraph buttons, which are otherwise laid out flush. */
-const spacer = (node, height) => {
-  const w = node.addWidget("text", "", "", () => {});
-  w.type = "h3spacer";
-  w.computeSize = () => [0, height];
-  w.draw = () => {};
-  w.serialize = false;
-  return w;
+/**
+ * Put air under a widget without adding one.
+ *
+ * The first attempt at this inserted a spacer widget — and ComfyUI backs a
+ * "text" widget with a real DOM input, so giving it a positive height rendered
+ * an empty textbox, cursor and all, between the buttons. Nothing is added here
+ * instead: LiteGraph draws a button at its own fixed height but advances to the
+ * next widget by whatever computeSize reports, so an inflated height leaves a
+ * gap that has no element in it and cannot render anything.
+ */
+const padBelow = (widget, gap) => {
+  // globalThis, not a bare LiteGraph: an undeclared identifier throws a
+  // ReferenceError that optional chaining does not catch, which would take out
+  // node creation entirely if ComfyUI ever stopped exposing it globally.
+  const base = globalThis.LiteGraph?.NODE_WIDGET_HEIGHT ?? 20;
+  widget.computeSize = (width) => [width, base + gap];
+  return widget;
 };
 
 const resize = (node) => {
@@ -449,17 +457,12 @@ app.registerExtension({
         const w = widget(this, name);
         if (w) hideWidget(w);
       }
+      // LiteGraph stacks button widgets flush, so the primary action and the
+      // settings button read as one control. The gap goes on the first button
+      // itself — see padBelow.
       const open = this.addWidget("button", "🎬 프롬프트 메이커 열기", null, () => openOverlay(this));
-      const conn = this.addWidget("button", "⚙️ 모델 연결", null, () => openSettings(this));
-      // LiteGraph stacks button widgets flush against each other; a primary
-      // action and a settings button reading as one control is what made the
-      // node look unfinished. A spacer widget is the only way to separate them
-      // without patching LiteGraph's layout.
-      spacer(this, 6);
-      // Reorder so the spacer sits between the two buttons rather than after.
-      const ws = this.widgets;
-      ws.splice(ws.indexOf(conn), 1);
-      ws.push(conn);
+      padBelow(open, 8);
+      this.addWidget("button", "⚙️ 모델 연결", null, () => openSettings(this));
 
       this.h3Status = summarize(readJson(this, "result", {}));
       this.h3Conn = describeConn(readJson(this, "llm", {}));
