@@ -118,6 +118,12 @@ eq("sheet: a different frame count is quoted, not the default",
    "16 frames" in R._build_user_text(dict(body, videoFrameCount=16), 2, 1), True)
 ok("sheet: no sheet block when no clip was attached",
    "contact sheet" not in R._build_user_text(body, 2, 0))
+eq("sheet: one clip gets one tag, not a range from 1 to 1",
+   "<Video 1> ... <Video 1>" in sheet_text, False)
+ok("sheet: one clip is still tagged", "<Video 1>" in sheet_text)
+ok("sheet: three clips get a range",
+   "<Video 1> ... <Video 3>" in R._build_user_text(body, 2, 3))
+
 ok("sheet: pictures are still described alongside",
    "<Picture 1> — 얼굴 기준" in sheet_text)
 

@@ -94,9 +94,11 @@ def _build_user_text(body, image_count, sheet_count=0, audio_count=0):
 
     if sheet_count:
         n = int(body.get("videoFrameCount") or 8)
+        # "<Video 1> ... <Video 1>" reads like two clips. One clip gets one tag.
+        tags = "<Video 1>" if sheet_count == 1 else f"<Video 1> ... <Video {sheet_count}>"
         lines.append(
             f"Attached after the reference pictures are {sheet_count} contact sheet(s), one per "
-            f"reference clip: <Video 1> ... <Video {sheet_count}>, in that order. Each sheet tiles "
+            f"reference clip: {tags}, in that order. Each sheet tiles "
             f"{n} frames sampled evenly across that clip, left to right and top to bottom, with the "
             f"frame number and its timestamp printed under each cell. Read them as one moving shot, "
             f"not as separate stills: the change between cells is the camera path, the subject's "
