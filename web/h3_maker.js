@@ -40,6 +40,8 @@ const DEFAULT_LLM = {
   max_tokens: 60000,
   //  auto  the model's own default | off  suppress it | on  force it
   thinking: "auto",
+  //  keep  stay resident | 5m  unload after five idle minutes | now  unload at once
+  unload_after: "keep",
   /** Epoch ms of the last successful 연결 확인, 0 when never checked. */
   verifiedAt: 0,
 };
@@ -334,6 +336,15 @@ const openSettings = async (node) => {
   inputs.thinking.value = cfg.thinking || "auto";
   row("thinking", "thinking", inputs.thinking);
 
+  inputs.unload_after = el("select", FIELD_STYLE);
+  for (const [value, label] of [
+    ["keep", "유지 — 다음 생성이 가장 빠름 (VRAM 점유)"],
+    ["5m", "5분 유지 — 그 뒤 자동 언로드"],
+    ["now", "즉시 언로드 — 생성이 끝나면 바로 내림"],
+  ]) inputs.unload_after.append(new Option(label, value));
+  inputs.unload_after.value = cfg.unload_after || "keep";
+  row("unload_after", "생성 후", inputs.unload_after);
+
   inputs.max_tokens = el("input", FIELD_STYLE, {
     type: "number", step: "1024", min: "1024", max: "1000000", value: cfg.max_tokens,
   });
@@ -341,6 +352,8 @@ const openSettings = async (node) => {
   const tokenHint = el("p", { margin: "-4px 0 0 104px", fontSize: "11px", color: "#8b949e", lineHeight: "1.5" }, {
     textContent: "thinking: Qwen3 같은 추론 모델은 답하기 전에 max_tokens 예산을 생각하는 데 씁니다. "
                + "off로 두면 그 예산이 전부 답변으로 갑니다 (/no_think + 템플릿 스위치, 모르는 서버는 무시). "
+               + "생성 후: 모델을 유지할지 내릴지. 내려도 다음 생성 때 자동으로 다시 로드됩니다 "
+               + "(첫 요청이 로드를 겸하므로 그만큼 느려집니다). llama.cpp·vLLM은 프로세스가 곧 모델이라 해당 없음. "
                + "max_tokens: 너무 낮으면 본문 없이 한 줄만 돌아옵니다. 기본 60000.",
   });
   box.append(tokenHint);
@@ -464,6 +477,7 @@ const openSettings = async (node) => {
       temperature: Number(inputs.temperature.value) || 0.7,
       max_tokens: Number(inputs.max_tokens.value) || 60000,
       thinking: inputs.thinking.value,
+      unload_after: inputs.unload_after.value,
       // Recorded so the node face can distinguish a checked configuration from
       // one that was merely typed in and saved.
       verifiedAt: verified ? Date.now() : 0,

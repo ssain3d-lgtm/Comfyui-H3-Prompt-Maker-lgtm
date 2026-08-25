@@ -56,6 +56,29 @@ def clamp_max_tokens(value, default=DEFAULT_MAX_TOKENS):
     return max(MIN_MAX_TOKENS, min(MAX_MAX_TOKENS, n))
 
 
+#: What happens to the model after a generation finishes.
+#: "keep"  stay resident — fastest next run, holds the VRAM
+#: "5m"    stay for five idle minutes, then unload
+#: "now"   unload as soon as the answer is returned
+UNLOAD_MODES = ["keep", "5m", "now"]
+
+#: Idle seconds per mode. There is no unload endpoint the four supported
+#: backends share, but both servers that can unload at all take a time-to-live
+#: on the request itself — LM Studio as `ttl`, Ollama as `keep_alive` — so the
+#: policy rides along with the generation instead of needing a second call.
+#: llama.cpp and vLLM hold one model for the life of the process; they ignore
+#: both fields, which is the correct behaviour there rather than a failure.
+_TTL_SECONDS = {"5m": 300, "now": 1}
+
+
+def unload_payload(mode):
+    """The keep-alive fields for `mode`, or {} when the model should stay put."""
+    if mode not in _TTL_SECONDS:
+        return {}
+    seconds = _TTL_SECONDS[mode]
+    return {"ttl": seconds, "keep_alive": 0 if mode == "now" else f"{seconds // 60}m"}
+
+
 #: Whether to let a reasoning model think before answering.
 #: "auto"  send nothing — the model's own default
 #: "off"   suppress it: the whole budget goes to the answer
@@ -98,7 +121,7 @@ def _extract_text(data):
 
 def call_openai_compatible(base_url, model, api_key, system_prompt, user_text,
                            images_base64=None, temperature=0.7, seed=-1, timeout=600,
-                           max_tokens=DEFAULT_MAX_TOKENS, thinking="auto"):
+                           max_tokens=DEFAULT_MAX_TOKENS, thinking="auto", unload_after="keep"):
     url = base_url.rstrip("/") + "/chat/completions"
     user_text = apply_thinking(user_text, thinking)
 
@@ -121,6 +144,7 @@ def call_openai_compatible(base_url, model, api_key, system_prompt, user_text,
     }
     if seed is not None and seed >= 0:
         payload["seed"] = int(seed)
+    payload.update(unload_payload(unload_after))
     if thinking in ("off", "on"):
         # vLLM and recent LM Studio builds switch Qwen3's chat template with
         # this. It is the reliable half of the switch where it is supported;
@@ -136,8 +160,13 @@ def call_openai_compatible(base_url, model, api_key, system_prompt, user_text,
         msg = str(first).lower()
         # A server that does not know chat_template_kwargs may reject the whole
         # request. Drop it and let the text token carry the intent alone.
-        if "chat_template_kwargs" in payload and ("400" in msg or "template" in msg or "extra" in msg):
-            payload.pop("chat_template_kwargs")
+        # A server that does not know one of the optional fields may reject the
+        # whole request. Shed them and retry on the essentials.
+        optional = [k for k in ("chat_template_kwargs", "ttl", "keep_alive") if k in payload]
+        if optional and ("400" in msg or "template" in msg or "extra" in msg
+                         or "unrecognized" in msg or "unknown" in msg):
+            for k in optional:
+                payload.pop(k)
             return _extract_text(post())
         # Only a vision rejection is worth a second call. Retrying a dead server
         # or a 401 just doubles the wait (and, on a paid endpoint, the bill).
@@ -280,7 +309,8 @@ def resolve_api_key(api_key):
 
 def call_llm(backend, base_url, model, api_key, cli_command, system_prompt,
              user_text, images_base64=None, temperature=0.7, seed=-1, timeout=600,
-             server_model=AUTO_MODEL, max_tokens=DEFAULT_MAX_TOKENS, thinking="auto"):
+             server_model=AUTO_MODEL, max_tokens=DEFAULT_MAX_TOKENS, thinking="auto",
+             unload_after="keep"):
     kind, url, mdl, cmd = resolve_backend(backend, base_url, model, cli_command, server_model)
     if kind == "cli":
         # A CLI runner has no template switch; the text token is all there is.
@@ -289,7 +319,7 @@ def call_llm(backend, base_url, model, api_key, cli_command, system_prompt,
     return call_openai_compatible(url, mdl, api_key, system_prompt, user_text,
                                   images_base64=images_base64, temperature=temperature,
                                   seed=seed, timeout=timeout, max_tokens=max_tokens,
-                                  thinking=thinking)
+                                  thinking=thinking, unload_after=unload_after)
 
 
 def probe_backend(backend, base_url, api_key, cli_command, timeout=6.0):

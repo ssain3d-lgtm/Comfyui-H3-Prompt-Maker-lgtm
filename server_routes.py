@@ -18,7 +18,7 @@ import traceback
 from .h3_prompts import build_system_prompt, nearest_grid_frames
 from .llm_backends import (
     AUTO_MODEL, BACKEND_NAMES, LLMError, PRESET_BASE_URLS, PRESET_CLI_COMMANDS,
-    THINKING_MODES, call_llm, clamp_max_tokens, discover_local_models,
+    THINKING_MODES, UNLOAD_MODES, call_llm, clamp_max_tokens, discover_local_models,
     normalize_backend, probe_backend, warm_up_model,
 )
 
@@ -125,6 +125,8 @@ def _llm_settings(body):
         "max_tokens": clamp_max_tokens(llm.get("max_tokens")),
         "thinking": (str(llm.get("thinking") or "auto")
                      if str(llm.get("thinking") or "auto") in THINKING_MODES else "auto"),
+        "unload_after": (str(llm.get("unload_after") or "keep")
+                         if str(llm.get("unload_after") or "keep") in UNLOAD_MODES else "keep"),
     }
 
 
@@ -156,6 +158,7 @@ def register(routes):
         return _json({
             "backends": BACKEND_NAMES,
             "thinking_modes": THINKING_MODES,
+            "unload_modes": UNLOAD_MODES,
             "preset_base_urls": PRESET_BASE_URLS,
             "preset_cli_commands": PRESET_CLI_COMMANDS,
             "models": discover_local_models(),
@@ -241,6 +244,7 @@ def register(routes):
                 system_prompt, user_text, images_base64=send_images,
                 temperature=cfg["temperature"], server_model=cfg["server_model"],
                 max_tokens=cfg["max_tokens"], thinking=cfg["thinking"],
+                unload_after=cfg["unload_after"],
             )
         except LLMError as exc:
             return _json({"error": str(exc), "reason": "transient"}, status=502)
