@@ -5,7 +5,7 @@ MiniMax H3 (비디오+오디오 옴니모달 모델) 전용 **프롬프트 생�
 (T2VA / I2VA / FL2VA / L2VA / Ref2VA)의 영어 프롬프트를 설계하고,
 결과를 **같은 워크플로우의 H3 노드에 바로 와이어로 연결**할 수 있습니다.
 
-[H3 Prompt Maker 웹앱](https://github.com/ssain3d-lgtm/minimax-h3-prompt-maker-google-studio-ai-v2)과
+[H3 Prompt Maker 웹앱](https://github.com/ssain3d-lgtm/minimax-h3-prompt-maker-google-studio-ai-v3)과
 동일한 시스템 프롬프트를 사용합니다 (prompts.ts에서 그대로 추출).
 
 ## 설치
@@ -132,7 +132,7 @@ CLI 방식은 프로세스 기동 오버헤드 때문에 HTTP 서버 방식보�
 웹앱이 바뀌면 손으로 고치지 말고 재생성하세요:
 
 ```bash
-python3 tools/sync_app.py /path/to/minimax-h3-prompt-maker-google-studio-ai-v2
+python3 tools/sync_app.py /path/to/minimax-h3-prompt-maker-google-studio-ai-v3
 ```
 
 프롬프트 추출 → 오버레이 빌드 → `web/app/` 교체를 한 번에 하고, 번들에 CDN 참조가

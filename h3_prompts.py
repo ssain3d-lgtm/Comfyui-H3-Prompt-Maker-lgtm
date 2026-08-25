@@ -1,6 +1,6 @@
 """
 MiniMax H3 system prompts, extracted verbatim from the H3 Prompt Maker web app
-(minimax-h3-prompt-maker-google-studio-ai-v2, prompts.ts) so both stay in sync.
+(minimax-h3-prompt-maker-google-studio-ai-v3, prompts.ts) so both stay in sync.
 Regenerate with tools/extract_prompts.py — do not edit the constants by hand.
 Prompt guide adapted from https://github.com/teskor-hub/minimax-h3-skill (MIT, (c) 2026 teskor).
 """

@@ -4,7 +4,7 @@
 Usage:  python3 tools/extract_prompts.py /path/to/webapp/prompts.ts
 
 Keeps this node pack's system prompts byte-identical to the web app
-(minimax-h3-prompt-maker-google-studio-ai-v2). Run it whenever the web
+(minimax-h3-prompt-maker-google-studio-ai-v3). Run it whenever the web
 app's H3 prompt changes, then commit the regenerated h3_prompts.py.
 
 The templates used to live in server.ts alongside the express routes; the
@@ -87,7 +87,7 @@ def main(prompts_ts_path):
     out_path = pathlib.Path(__file__).resolve().parent.parent / 'h3_prompts.py'
     py = '''"""
 MiniMax H3 system prompts, extracted verbatim from the H3 Prompt Maker web app
-(minimax-h3-prompt-maker-google-studio-ai-v2, prompts.ts) so both stay in sync.
+(minimax-h3-prompt-maker-google-studio-ai-v3, prompts.ts) so both stay in sync.
 Regenerate with tools/extract_prompts.py — do not edit the constants by hand.
 Prompt guide adapted from https://github.com/teskor-hub/minimax-h3-skill (MIT, (c) 2026 teskor).
 """
