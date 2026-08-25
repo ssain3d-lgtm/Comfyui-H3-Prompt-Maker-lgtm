@@ -12,7 +12,7 @@ MiniMax H3 (비디오+오디오 옴니모달 모델) 전용 **프롬프트 생�
 
 ```bash
 cd ComfyUI/custom_nodes
-git clone https://github.com/ssain3d-lgtm/Comfyui-H3-Prompt-Maker-lgtm-.git
+git clone https://github.com/ssain3d-lgtm/Comfyui-H3-Prompt-Maker-lgtm.git
 # 추가 의존성 없음 (표준 라이브러리 + ComfyUI 기본 패키지만 사용)
 ```
 
