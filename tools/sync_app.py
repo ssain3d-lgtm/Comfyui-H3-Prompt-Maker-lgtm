@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Rebuild everything this pack vendors from the H3 Prompt Maker web app.
 
-Usage:  python3 tools/sync_app.py /path/to/minimax-h3-prompt-maker-google-studio-ai-v2
+Usage:  python3 tools/sync_app.py /path/to/minimax-h3-prompt-maker-google-studio-ai-v3
 
 Two things are copied out of the web app, and they must move together:
 

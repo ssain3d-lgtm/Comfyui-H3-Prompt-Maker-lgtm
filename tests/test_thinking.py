@@ -34,9 +34,9 @@ def ok(n, c, d=""):
     if c: passed += 1
     else: fails.append(f"{n}{chr(10)+'      '+str(d) if d else ''}")
 
-def call(mode, unload="keep"):
+def call(mode, unload="keep", backend="openai_compat"):
     seen.clear()
-    L.call_llm("openai_compat", "http://127.0.0.1:3401/v1", "m", "", "", "sys", "장면 요청",
+    L.call_llm(backend, "http://127.0.0.1:3401/v1", "m", "", "", "sys", "장면 요청",
                thinking=mode, max_tokens=60000, unload_after=unload)
     return seen
 
@@ -63,17 +63,19 @@ ok("reject: the retry dropped it", "chat_template_kwargs" not in calls[1])
 ok("reject: /no_think still carries the intent", calls[1]["messages"][1]["content"].endswith("/no_think"))
 REJECT["on"] = False
 # --- what happens to the model after the answer -----------------------------
-b = call("auto", "keep")[0]
-ok("keep: no time-to-live sent, the model stays put",
-   "ttl" not in b and "keep_alive" not in b, {k: b[k] for k in ("ttl", "keep_alive") if k in b})
-
-b = call("auto", "5m")[0]
-ok("5m: LM Studio ttl is 300s", b.get("ttl") == 300, b.get("ttl"))
-ok("5m: Ollama keep_alive is 5m", b.get("keep_alive") == "5m", b.get("keep_alive"))
+ok("keep: no time-to-live sent", L.unload_payload("keep", "lmstudio") == {})
+ok("5m: LM Studio receives only ttl",
+   L.unload_payload("5m", "lmstudio") == {"ttl": 300}, L.unload_payload("5m", "lmstudio"))
+ok("now: LM Studio receives only the ttl compatibility fallback",
+   L.unload_payload("now", "lmstudio") == {"ttl": 1}, L.unload_payload("now", "lmstudio"))
+ok("5m: Ollama receives only keep_alive",
+   L.unload_payload("5m", "ollama") == {"keep_alive": "5m"}, L.unload_payload("5m", "ollama"))
+ok("now: Ollama receives only its immediate-unload spelling",
+   L.unload_payload("now", "ollama") == {"keep_alive": 0}, L.unload_payload("now", "ollama"))
+ok("unknown OpenAI-compatible servers get no backend-specific fields",
+   L.unload_payload("now", "openai_compat") == {}, L.unload_payload("now", "openai_compat"))
 
 b = call("auto", "now")[0]
-ok("now: ttl drops to the minimum", b.get("ttl") == 1, b.get("ttl"))
-ok("now: Ollama is told to unload immediately", b.get("keep_alive") == 0, b.get("keep_alive"))
 
 # The model requested is the one the dialog saved — that is what makes the next
 # generation reload the right thing rather than whatever was resident.
@@ -81,7 +83,7 @@ ok("reload: the saved model id is what gets requested", b["model"] == "m", b["mo
 
 # A backend that knows none of these optional fields must still generate.
 REJECT["on"] = True
-calls = call("off", "now")
+calls = call("off", "5m", "lmstudio")
 ok("reject: one retry, not a failure", len(calls) == 2, f"{len(calls)} call(s)")
 ok("reject: every optional field was shed",
    not any(k in calls[1] for k in ("chat_template_kwargs", "ttl", "keep_alive")),

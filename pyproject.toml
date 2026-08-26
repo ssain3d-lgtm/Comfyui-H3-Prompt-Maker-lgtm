@@ -6,7 +6,7 @@ license = { file = "LICENSE" }
 dependencies = []
 
 [project.urls]
-Repository = "https://github.com/ssain3d-lgtm/Comfyui-H3-Prompt-Maker-lgtm-"
+Repository = "https://github.com/ssain3d-lgtm/Comfyui-H3-Prompt-Maker-lgtm"
 
 [tool.comfy]
 DisplayName = "MiniMax H3 Prompt Maker"

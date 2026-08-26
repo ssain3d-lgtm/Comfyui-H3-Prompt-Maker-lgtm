@@ -31,11 +31,35 @@ class Server(BaseHTTPRequestHandler):
 
     def log_message(self, *a): pass
 
+    def do_GET(self):
+        if self.path.endswith("/api/v1/models"):
+            loaded = ([{"id": MODEL, "config": {"context_length": 65536}}]
+                      if state["loaded"] == MODEL else [])
+            return self._send(200, {"models": [{
+                "type": "llm", "key": MODEL, "selected_variant": MODEL,
+                "variants": [MODEL], "architecture": "qwen3", "loaded_instances": loaded,
+            }]})
+        if self.path.endswith("/v1/models"):
+            return self._send(200, {"data": [{"id": MODEL}]})
+        return self._send(404, {"error": "not found"})
+
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))))
+        if self.path.endswith("/api/v1/models/load"):
+            want = body.get("model")
+            log.append({"kind": "load", "model": want})
+            state["loaded"] = want
+            return self._send(200, {"type": "llm", "instance_id": want, "status": "loaded"})
+        if self.path.endswith("/api/v1/models/unload"):
+            instance = body.get("instance_id")
+            log.append({"kind": "unload", "model": instance})
+            if state["loaded"] == instance:
+                state["loaded"] = None
+            return self._send(200, {"instance_id": instance})
+
         want = body.get("model")
         is_ping = body.get("max_tokens") == 1
-        log.append({"model": want, "ping": is_ping, "ttl": body.get("ttl"),
+        log.append({"kind": "ping" if is_ping else "gen", "model": want, "ping": is_ping, "ttl": body.get("ttl"),
                     "keep_alive": body.get("keep_alive"), "loaded_before": state["loaded"]})
 
         if state["loaded"] != want:
@@ -43,10 +67,11 @@ class Server(BaseHTTPRequestHandler):
                 return self._send(404, {"error": {"message": f"Model '{want}' not found"}})
             state["loaded"] = want                       # JIT: load on demand
 
-        # ttl 0/1 means drop it as soon as this answer is out; Ollama spells the
-        # same thing keep_alive: 0.
-        ttl, keep = body.get("ttl"), body.get("keep_alive")
-        drop = (ttl is not None and ttl <= 1) or keep == 0
+        # A manually loaded LM Studio model ignores a per-request ttl. This is
+        # the real bug the native unload endpoint fixes. Ollama's keep_alive=0
+        # remains an immediate instruction on the inference request itself.
+        keep = body.get("keep_alive")
+        drop = keep == 0
         out = {"choices": [{"message": {"content":
             "subject_definitions: a\nsummary: b\ndetailed_description: c"}}]}
         self._send(200, out)
@@ -81,9 +106,9 @@ def eq(n, a, b):
     ok(n, a == b, f"expected {b!r}, got {a!r}")
 
 
-def generate(unload):
+def generate(unload, backend="lmstudio"):
     log.clear()
-    return L.call_llm("openai_compat", URL, MODEL, "", "", "sys", "장면", max_tokens=60000,
+    return L.call_llm(backend, URL, MODEL, "", "", "sys", "장면", max_tokens=60000,
                       unload_after=unload)
 
 
@@ -97,14 +122,21 @@ eq("keep: the model stays in memory", state["loaded"], MODEL)
 state["loaded"] = MODEL
 generate("5m")
 eq("5m: ttl is 300 seconds", log[0]["ttl"], 300)
-eq("5m: keep_alive says 5m", log[0]["keep_alive"], "5m")
+eq("5m: LM Studio is not sent Ollama's keep_alive", log[0]["keep_alive"], None)
 eq("5m: the model is still there right after the answer", state["loaded"], MODEL)
 
 state["loaded"] = MODEL
 generate("now")
 eq("now: ttl is the shortest the servers accept", log[0]["ttl"], 1)
-eq("now: keep_alive is 0", log[0]["keep_alive"], 0)
+eq("now: LM Studio is not sent Ollama's keep_alive", log[0]["keep_alive"], None)
+eq("now: native unload follows generation", [e["kind"] for e in log], ["gen", "unload"])
 eq("now: the model is actually gone afterwards", state["loaded"], None)
+
+state["loaded"] = MODEL
+generate("now", "ollama")
+eq("ollama: no LM Studio ttl is sent", log[0]["ttl"], None)
+eq("ollama: keep_alive=0 unloads immediately", log[0]["keep_alive"], 0)
+eq("ollama: the model is gone afterwards", state["loaded"], None)
 
 # --- the reload half --------------------------------------------------------
 # This is the state the previous case leaves behind: nothing in memory.
@@ -127,14 +159,13 @@ ok("reload: and it is the model name that is reported, not a bare 404",
    raised is not None and MODEL in str(raised), str(raised)[:120])
 
 # Warming first is what makes the reload this code's doing rather than a side
-# effect of the server's own behaviour.
-state["loaded"], state["jit"] = None, True
-warm = L.warm_up_model("openai_compat", URL, "", MODEL)
+# effect of JIT. LM Studio v0.4 has a real load endpoint, so this succeeds even
+# with JIT disabled.
+state["loaded"], state["jit"] = None, False
+warm = L.warm_up_model("lmstudio", URL, "", MODEL)
 eq("warm: reports success", warm["ok"], True)
 eq("warm: the model is in memory before any real call", state["loaded"], MODEL)
-eq("warm: it is a one-token ping, not a real generation", log[-1]["ping"], True)
-eq("warm: the ping carries no ttl, so it does not unload what it just loaded",
-   log[-1]["ttl"], None)
+eq("warm: native load is used instead of a one-token inference", log[-1]["kind"], "load")
 
 # --- through the route, which is what actually runs ------------------------
 # The library doing the right thing is not the same as the route calling it.
@@ -167,7 +198,7 @@ class FakeReq:
 def via_route(unload):
     log.clear()
     body = {"promptText": "골목", "minimaxStyle": "ref2va", "duration": 10,
-            "llm": {"backend": "openai_compat", "base_url": URL, "model": MODEL,
+            "llm": {"backend": "lmstudio", "base_url": URL, "model": MODEL,
                     "api_key": "", "cli_command": "", "temperature": 0.7,
                     "max_tokens": 60000, "thinking": "auto", "unload_after": unload}}
     routes = []
@@ -182,8 +213,20 @@ def via_route(unload):
 
     R.register(Table())
     handler = next(fn for path, fn in routes if path.endswith("/generate-prompt"))
-    resp = asyncio.run(handler(FakeReq(body)))
-    return json.loads(resp.text), [("ping" if e["ping"] else "gen") for e in log]
+    # Keep this test dependency-free like the rest of the pack: server_routes
+    # imports aiohttp only when constructing the response, so replace that tiny
+    # boundary rather than requiring ComfyUI's environment in CI.
+    original_json = R._json
+    class Resp:
+        def __init__(self, payload, status):
+            self.text = json.dumps(payload)
+            self.status = status
+    R._json = lambda payload, status=200: Resp(payload, status)
+    try:
+        resp = asyncio.run(handler(FakeReq(body)))
+    finally:
+        R._json = original_json
+    return json.loads(resp.text), [e["kind"] for e in log]
 
 
 state["loaded"], state["jit"] = MODEL, True
@@ -193,21 +236,19 @@ ok("route: keep still answers", "subject_definitions" in out.get("result", ""))
 
 state["loaded"], state["jit"] = None, True
 out, seq = via_route("now")
-eq("route: an unload setting loads the model before generating", seq, ["ping", "gen"])
+eq("route: an unload setting loads, generates, then really unloads", seq, ["load", "gen", "unload"])
 ok("route: and the generate then succeeds", "subject_definitions" in out.get("result", ""))
 eq("route: the model is unloaded again afterwards", state["loaded"], None)
 
 out, seq = via_route("5m")
-eq("route: 5m warms up too — the model may have aged out", seq, ["ping", "gen"])
+eq("route: 5m warms up too — the model may have aged out", seq, ["load", "gen"])
 eq("route: and 5m leaves it loaded", state["loaded"], MODEL)
 
-# The case that used to be a bare 404 with nothing pointing at the cause.
+# Native load/unload must not depend on JIT being enabled.
 state["loaded"], state["jit"] = None, False
 out, seq = via_route("now")
-ok("route: a server that will not load says so, not just 404",
-   "JIT" in out.get("error", ""), out.get("error", "")[:160])
-ok("route: and names the setting responsible", "생성 후" in out.get("error", ""))
-eq("route: it is still a transient failure, not a permanent one", out.get("reason"), "transient")
+eq("route: JIT-off still uses explicit load and unload", seq, ["load", "gen", "unload"])
+ok("route: JIT-off generation succeeds", "subject_definitions" in out.get("result", ""), out)
 
 srv.shutdown()
 if fails:

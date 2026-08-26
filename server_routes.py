@@ -273,13 +273,9 @@ def register(routes):
         # A CLI backend takes stdin only, so pictures cannot travel with it.
         send_images = (images + sheets) if not cfg["backend"].endswith("_cli") else []
 
-        # If the last run was told to unload, the model is not in memory any
-        # more. Ollama and LM Studio's JIT loading would fetch it on the real
-        # call, but only as a side effect: LM Studio with JIT switched off
-        # answers 404 instead, and where it does work the load happens inside
-        # the generation with nothing distinguishing it from a slow model.
-        # Loading it first makes the reload something this code does, and lets
-        # the failure say which half went wrong.
+        # If the last run was told to unload, put the selected model back before
+        # the real generation. LM Studio v0.4+ has a native load endpoint; other
+        # servers and older LM Studio builds use the one-token fallback.
         warm_note = None
         if cfg["unload_after"] != "keep" and not cfg["backend"].endswith("_cli"):
             try:

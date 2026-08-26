@@ -354,8 +354,8 @@ const openSettings = async (node) => {
   const tokenHint = el("p", { margin: "-4px 0 0 104px", fontSize: "11px", color: "#8b949e", lineHeight: "1.5" }, {
     textContent: "thinking: Qwen3 같은 추론 모델은 답하기 전에 max_tokens 예산을 생각하는 데 씁니다. "
                + "off로 두면 그 예산이 전부 답변으로 갑니다 (/no_think + 템플릿 스위치, 모르는 서버는 무시). "
-               + "생성 후: 모델을 유지할지 내릴지. 내려도 다음 생성 때 자동으로 다시 로드됩니다 "
-               + "(첫 요청이 로드를 겸하므로 그만큼 느려집니다). llama.cpp·vLLM은 프로세스가 곧 모델이라 해당 없음. "
+               + "생성 후: 모델을 유지할지 내릴지. LM Studio는 공식 load/unload API로 다시 올리고 실제로 내립니다. "
+               + "Ollama는 keep_alive를 사용합니다. llama.cpp·vLLM은 프로세스가 곧 모델이라 해당 없음. "
                + "max_tokens: 너무 낮으면 본문 없이 한 줄만 돌아옵니다. 기본 60000.",
   });
   box.append(tokenHint);

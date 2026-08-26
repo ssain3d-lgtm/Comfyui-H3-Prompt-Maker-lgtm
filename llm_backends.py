@@ -15,6 +15,7 @@ import json
 import os
 import shlex
 import subprocess
+import sys
 import urllib.request
 import urllib.error
 import urllib.parse
@@ -64,21 +65,31 @@ def clamp_max_tokens(value, default=DEFAULT_MAX_TOKENS):
 #: "now"   unload as soon as the answer is returned
 UNLOAD_MODES = ["keep", "5m", "now"]
 
-#: Idle seconds per mode. There is no unload endpoint the four supported
-#: backends share, but both servers that can unload at all take a time-to-live
-#: on the request itself — LM Studio as `ttl`, Ollama as `keep_alive` — so the
-#: policy rides along with the generation instead of needing a second call.
-#: llama.cpp and vLLM hold one model for the life of the process; they ignore
-#: both fields, which is the correct behaviour there rather than a failure.
+#: Idle seconds per mode. LM Studio uses ttl for JIT-loaded models and its native
+#: v1 endpoint for a guaranteed immediate unload; Ollama uses keep_alive on the
+#: inference request. llama.cpp and vLLM hold one model for the process lifetime.
 _TTL_SECONDS = {"5m": 300, "now": 1}
 
 
-def unload_payload(mode):
-    """The keep-alive fields for `mode`, or {} when the model should stay put."""
+def unload_payload(mode, backend="openai_compat"):
+    """Backend-specific keep-alive fields for ``mode``.
+
+    Sending both dialects at once looks portable, but strict servers reject the
+    field they do not know.  The old retry then removed *both* fields, so the
+    generation succeeded while the model silently stayed in VRAM.
+    """
     if mode not in _TTL_SECONDS:
         return {}
     seconds = _TTL_SECONDS[mode]
-    return {"ttl": seconds, "keep_alive": 0 if mode == "now" else f"{seconds // 60}m"}
+    backend = normalize_backend(backend)
+    if backend == "lmstudio":
+        # TTL remains a compatibility fallback for pre-v0.4 LM Studio and for
+        # JIT-loaded models.  Immediate unload is also enforced through the
+        # native /api/v1/models/unload endpoint after a successful generation.
+        return {"ttl": seconds}
+    if backend == "ollama":
+        return {"keep_alive": 0 if mode == "now" else f"{seconds // 60}m"}
+    return {}
 
 
 #: Whether to let a reasoning model think before answering.
@@ -161,7 +172,7 @@ def audio_format(b64):
 def call_openai_compatible(base_url, model, api_key, system_prompt, user_text,
                            images_base64=None, temperature=0.7, seed=-1, timeout=600,
                            max_tokens=DEFAULT_MAX_TOKENS, thinking="auto", unload_after="keep",
-                           audios_base64=None):
+                           audios_base64=None, backend_name="openai_compat"):
     url = base_url.rstrip("/") + "/chat/completions"
     user_text = apply_thinking(user_text, thinking)
 
@@ -190,7 +201,7 @@ def call_openai_compatible(base_url, model, api_key, system_prompt, user_text,
     }
     if seed is not None and seed >= 0:
         payload["seed"] = int(seed)
-    payload.update(unload_payload(unload_after))
+    payload.update(unload_payload(unload_after, backend_name))
     if thinking in ("off", "on"):
         # vLLM and recent LM Studio builds switch Qwen3's chat template with
         # this. It is the reliable half of the switch where it is supported;
@@ -200,40 +211,48 @@ def call_openai_compatible(base_url, model, api_key, system_prompt, user_text,
     def post():
         return _post_json(url, payload, api_key, timeout)
 
-    try:
-        return _extract_text(post())
-    except LLMError as first:
-        msg = str(first).lower()
-        # A server that does not know chat_template_kwargs may reject the whole
-        # request. Drop it and let the text token carry the intent alone.
-        # A server that does not know one of the optional fields may reject the
-        # whole request. Shed them and retry on the essentials.
-        optional = [k for k in ("chat_template_kwargs", "ttl", "keep_alive") if k in payload]
-        if optional and ("400" in msg or "template" in msg or "extra" in msg
-                         or "unrecognized" in msg or "unknown" in msg):
-            for k in optional:
-                payload.pop(k)
-            return _extract_text(post())
-        # Audio is the part most models lack, so it is shed first and alone:
-        # dropping the pictures at the same time would throw away a reference
-        # the model could actually have read.
-        media_rejected = ("image" in msg or "vision" in msg or "audio" in msg
-                          or "content" in msg or "400" in msg)
-        if audios_base64 and media_rejected:
-            payload["messages"][1]["content"] = [
-                part for part in payload["messages"][1]["content"] if part.get("type") != "input_audio"
-            ]
-            try:
-                return _extract_text(post())
-            except LLMError as second:
-                msg = str(second).lower()
-                media_rejected = ("image" in msg or "vision" in msg or "content" in msg or "400" in msg)
-        # Only a vision rejection is worth a further call. Retrying a dead
-        # server or a 401 just doubles the wait (and, on a paid endpoint, the bill).
-        if images_base64 and media_rejected:
-            payload["messages"][1]["content"] = user_text
-            return _extract_text(post())
-        raise
+    # Each retry removes one optional capability and then comes back through
+    # the same error handler.  The previous nested returns stopped after an
+    # unsupported-audio 400 whenever ttl/keep_alive was also present: retry 1
+    # removed the TTL fields, retry 2 hit the same audio 400 and escaped before
+    # the audio-shedding branch could run.
+    while True:
+        try:
+            answer = _extract_text(post())
+            break
+        except LLMError as exc:
+            msg = str(exc).lower()
+            optional = [k for k in ("chat_template_kwargs", "ttl", "keep_alive") if k in payload]
+            optional_rejected = ("400" in msg or "template" in msg or "extra" in msg
+                                 or "unrecognized" in msg or "unknown" in msg)
+            if optional and optional_rejected:
+                for key in optional:
+                    payload.pop(key, None)
+                continue
+
+            content_now = payload["messages"][1]["content"]
+            parts = content_now if isinstance(content_now, list) else []
+            media_rejected = ("image" in msg or "vision" in msg or "audio" in msg
+                              or "content" in msg or "400" in msg)
+            if media_rejected and any(p.get("type") == "input_audio" for p in parts):
+                payload["messages"][1]["content"] = [
+                    part for part in parts if part.get("type") != "input_audio"
+                ]
+                continue
+            if media_rejected and any(p.get("type") == "image_url" for p in parts):
+                payload["messages"][1]["content"] = user_text
+                continue
+            raise
+
+    # LM Studio documents ttl as applying to JIT-loaded instances.  A model
+    # loaded manually or with `lms load` can therefore ignore ttl entirely.
+    # v0.4's native endpoint unloads the actual loaded instance regardless of
+    # how it entered memory, which is what "즉시 언로드" promises.
+    if normalize_backend(backend_name) == "lmstudio" and unload_after == "now":
+        result = _unload_lmstudio_model(base_url, api_key, model, min(timeout, 15.0))
+        if not result["ok"]:
+            print(f"H3 Prompt Maker: LM Studio unload warning: {result['detail']}", file=sys.stderr)
+    return answer
 
 
 def call_cli(cli_command, system_prompt, user_text, timeout=600):
@@ -376,6 +395,84 @@ def _lmstudio_metadata_urls(openai_base_url):
     return [make_url("/api/v1/models"), make_url("/api/v0/models")]
 
 
+def _lmstudio_native_models(openai_base_url, api_key, timeout):
+    """LM Studio v1 model metadata, or ``None`` on pre-v0.4 servers."""
+    endpoint = _lmstudio_metadata_urls(openai_base_url)[0]
+    req = urllib.request.Request(endpoint)
+    if api_key:
+        req.add_header("Authorization", f"Bearer {api_key}")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as res:
+            payload = json.loads(res.read().decode("utf-8", errors="replace"))
+    except Exception:
+        return None
+    rows = payload.get("models") if isinstance(payload, dict) else None
+    return rows if isinstance(rows, list) else None
+
+
+def _lmstudio_matching_rows(rows, model):
+    """Rows whose key, selected variant or variant list names ``model``."""
+    matches = []
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        identifiers = [row.get("id"), row.get("key"), row.get("selected_variant")]
+        variants = row.get("variants")
+        if isinstance(variants, list):
+            identifiers.extend(variants)
+        loaded = row.get("loaded_instances")
+        if isinstance(loaded, list):
+            identifiers.extend(x.get("id") for x in loaded if isinstance(x, dict))
+        if model in identifiers:
+            matches.append(row)
+    return matches
+
+
+def _load_lmstudio_model(openai_base_url, api_key, model, timeout):
+    """Load through LM Studio's native v1 API; report unsupported for old builds."""
+    rows = _lmstudio_native_models(openai_base_url, api_key, timeout)
+    if rows is None:
+        return {"ok": False, "supported": False, "detail": "native v1 model API unavailable"}
+    matches = _lmstudio_matching_rows(rows, model)
+    if matches and any(row.get("loaded_instances") for row in matches):
+        return {"ok": True, "supported": True, "detail": f"{model} 이미 메모리에 로드됨"}
+    endpoint = _lmstudio_metadata_urls(openai_base_url)[0] + "/load"
+    try:
+        data = _post_json(endpoint, {"model": model}, api_key, timeout)
+    except Exception as exc:
+        return {"ok": False, "supported": True, "detail": f"LM Studio native load failed: {exc}"}
+    instance = data.get("instance_id") if isinstance(data, dict) else None
+    return {"ok": True, "supported": True,
+            "detail": f"{model} 메모리에 로드됨" + (f" ({instance})" if instance else "")}
+
+
+def _unload_lmstudio_model(openai_base_url, api_key, model, timeout):
+    """Unload every loaded instance of the selected LM Studio model."""
+    rows = _lmstudio_native_models(openai_base_url, api_key, timeout)
+    if rows is None:
+        return {"ok": False, "supported": False,
+                "detail": "native v1 model API unavailable; ttl fallback was used"}
+    matches = _lmstudio_matching_rows(rows, model)
+    instance_ids = []
+    for row in matches:
+        for instance in row.get("loaded_instances") or []:
+            iid = instance.get("id") if isinstance(instance, dict) else None
+            if iid and iid not in instance_ids:
+                instance_ids.append(iid)
+    if not instance_ids:
+        return {"ok": True, "supported": True, "detail": f"{model} 이미 언로드됨"}
+
+    endpoint = _lmstudio_metadata_urls(openai_base_url)[0] + "/unload"
+    for instance_id in instance_ids:
+        try:
+            _post_json(endpoint, {"instance_id": instance_id}, api_key, timeout)
+        except Exception as exc:
+            return {"ok": False, "supported": True,
+                    "detail": f"{instance_id} native unload failed: {exc}"}
+    return {"ok": True, "supported": True,
+            "detail": f"{len(instance_ids)}개 인스턴스 언로드됨"}
+
+
 def _lmstudio_chat_models(openai_base_url, api_key, timeout, fallback_ids):
     """Return metadata-filtered ids, falling back on older LM Studio builds."""
     for endpoint in _lmstudio_metadata_urls(openai_base_url):
@@ -457,6 +554,7 @@ def call_llm(backend, base_url, model, api_key, cli_command, system_prompt,
              user_text, images_base64=None, temperature=0.7, seed=-1, timeout=600,
              server_model=AUTO_MODEL, max_tokens=DEFAULT_MAX_TOKENS, thinking="auto",
              unload_after="keep", audios_base64=None):
+    backend = normalize_backend(backend)
     kind, url, mdl, cmd = resolve_backend(backend, base_url, model, cli_command, server_model)
     if kind == "cli":
         # A CLI runner has no template switch; the text token is all there is.
@@ -464,9 +562,9 @@ def call_llm(backend, base_url, model, api_key, cli_command, system_prompt,
     api_key = resolve_api_key(api_key)
     return call_openai_compatible(url, mdl, api_key, system_prompt, user_text,
                                   images_base64=images_base64, temperature=temperature,
-                                  seed=seed, timeout=timeout, max_tokens=max_tokens,
-                                  thinking=thinking, unload_after=unload_after,
-                                  audios_base64=audios_base64)
+                                   seed=seed, timeout=timeout, max_tokens=max_tokens,
+                                   thinking=thinking, unload_after=unload_after,
+                                   audios_base64=audios_base64, backend_name=backend)
 
 
 def probe_backend(backend, base_url, api_key, cli_command, timeout=6.0):
@@ -527,10 +625,9 @@ def probe_backend(backend, base_url, api_key, cli_command, timeout=6.0):
 def warm_up_model(backend, base_url, api_key, model, timeout=180.0):
     """Make the server load `model` into memory now, rather than mid-generation.
 
-    LM Studio, Ollama and vLLM all load a model lazily on its first request, so
-    the first real prompt otherwise pays a stall long enough to look like a
-    hang. A one-token completion is the portable way to trigger that — there is
-    no load endpoint the four backends share.
+    LM Studio v0.4+ uses its native load endpoint, which works even when JIT is
+    disabled. Other servers (and older LM Studio builds) use a one-token
+    completion as the portable fallback.
 
     Returns {ok, detail}. Never raises.
     """
@@ -546,6 +643,14 @@ def warm_up_model(backend, base_url, api_key, model, timeout=180.0):
         if model not in chat_models:
             return {"ok": False,
                     "detail": f"{model}은(는) 채팅 모델이 아닙니다 (mmproj/embedding 제외)."}
+        native = _load_lmstudio_model(url, key, model, timeout)
+        if native["ok"]:
+            return {"ok": True, "detail": native["detail"]}
+        # LM Studio before v0.4 has no native load endpoint. Keep the existing
+        # one-token JIT fallback for those builds, but do not hide a real error
+        # from a server that does advertise the native API.
+        if native["supported"]:
+            return {"ok": False, "detail": native["detail"]}
     body = {
         "model": model,
         "messages": [{"role": "user", "content": "ping"}],

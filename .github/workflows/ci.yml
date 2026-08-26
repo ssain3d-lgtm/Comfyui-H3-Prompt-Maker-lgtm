@@ -12,6 +12,9 @@ jobs:
       - run: python3 tests/test_routes.py
       - run: python3 tests/test_system_prompt.py
       - run: python3 tests/test_thinking.py
+      - run: python3 tests/test_media_parts.py
+      - run: python3 tests/test_model_filtering.py
+      - run: python3 tests/test_unload_reload.py
       # The overlay is a committed build artifact, so it can silently go stale.
       # This does not rebuild it (that needs the web app checkout) — it checks
       # that what is committed is servable and self-contained.

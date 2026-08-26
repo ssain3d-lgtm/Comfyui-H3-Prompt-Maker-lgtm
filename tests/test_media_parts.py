@@ -74,10 +74,11 @@ OGG = base64.b64encode(b"OggS\x00\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00").
 M4A = base64.b64encode(b"\x00\x00\x00\x20ftypM4A \x00\x00\x00\x00").decode()
 
 
-def call(images=None, audios=None):
+def call(images=None, audios=None, thinking="auto", unload="keep", backend="openai_compat"):
     seen.clear()
-    return L.call_llm("openai_compat", "http://127.0.0.1:3402/v1", "m", "", "", "sys", "장면 요청",
-                      images_base64=images, audios_base64=audios, max_tokens=60000)
+    return L.call_llm(backend, "http://127.0.0.1:3402/v1", "m", "", "", "sys", "장면 요청",
+                      images_base64=images, audios_base64=audios, max_tokens=60000,
+                      thinking=thinking, unload_after=unload)
 
 
 def parts(body):
@@ -135,6 +136,18 @@ eq("shed: the retry drops audio", [x["type"] for x in parts(seen[1])], ["text", 
 ok("shed: the retry keeps the picture", parts(seen[1])[1]["image_url"]["url"].endswith(JPEG))
 ok("shed: the prompt survives", parts(seen[1])[0]["text"] == "장면 요청")
 eq("shed: max_tokens survives the retry", seen[1]["max_tokens"], 60000)
+
+# The overlay defaults to immediate unload, and a user may also turn thinking
+# off. Both add optional request fields. The first 400 used to shed those fields
+# and return directly from retry 1; retry 2 hit the same unsupported audio and
+# escaped without ever reaching the audio-removal branch.
+REJECT["audio"], REJECT["vision"] = True, False
+call(images=[JPEG], audios=[WAV], thinking="off", unload="5m", backend="lmstudio")
+eq("shed+optional: optional fields then audio are handled in one retry loop", len(seen), 3)
+ok("shed+optional: retry 2 removed template and ttl",
+   not any(k in seen[1] for k in ("chat_template_kwargs", "ttl", "keep_alive")), seen[1])
+eq("shed+optional: final request keeps the picture and drops audio",
+   [x["type"] for x in parts(seen[2])], ["text", "image_url"])
 
 # A text-only model rejects both. Audio goes first, then everything.
 REJECT["audio"] = REJECT["vision"] = True
