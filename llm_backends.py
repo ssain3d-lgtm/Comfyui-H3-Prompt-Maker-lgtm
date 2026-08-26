@@ -17,6 +17,7 @@ import shlex
 import subprocess
 import urllib.request
 import urllib.error
+import urllib.parse
 
 
 class LLMError(RuntimeError):
@@ -308,6 +309,92 @@ _MODEL_CACHE = {"at": 0.0, "ids": []}
 _MODEL_CACHE_TTL = 30.0
 
 
+_NON_CHAT_ARCHITECTURES = {"clip", "nomic-bert"}
+_CHAT_MODEL_TYPES = {"llm", "vlm"}
+
+
+def _model_ids(payload):
+    """Unique ids from an OpenAI-compatible ``GET /v1/models`` response."""
+    ids = []
+    for model in (payload.get("data") or []):
+        mid = model.get("id") if isinstance(model, dict) else None
+        if mid and mid not in ids:
+            ids.append(mid)
+    return ids
+
+
+def _filter_lmstudio_chat_models(openai_ids, metadata):
+    """Drop projectors and embedding models using LM Studio's rich metadata.
+
+    ``/v1/models`` deliberately exposes every downloaded GGUF when JIT loading
+    is enabled, and its OpenAI-shaped rows do not reliably distinguish a chat
+    model from an mmproj/CLIP file. LM Studio's native model list does. Keep
+    the OpenAI order because those are the ids users already see and save.
+    """
+    rows = None
+    if isinstance(metadata, dict):
+        rows = metadata.get("models")
+        if not isinstance(rows, list):
+            rows = metadata.get("data")
+    if not isinstance(rows, list):
+        return list(openai_ids)
+
+    allowed = []
+    saw_metadata = False
+    for model in rows:
+        if not isinstance(model, dict):
+            continue
+        model_type = str(model.get("type") or "").lower()
+        architecture = str(model.get("arch") or model.get("architecture") or "").lower()
+        if model_type or architecture:
+            saw_metadata = True
+        if model_type and model_type not in _CHAT_MODEL_TYPES:
+            continue
+        if architecture in _NON_CHAT_ARCHITECTURES:
+            continue
+        identifiers = [model.get("id"), model.get("key"), model.get("selected_variant")]
+        identifiers.extend(model.get("variants") or [])
+        for mid in identifiers:
+            if isinstance(mid, str) and mid and mid not in allowed:
+                allowed.append(mid)
+
+    if not saw_metadata:
+        return list(openai_ids)
+    allowed_set = set(allowed)
+    return [mid for mid in openai_ids if mid in allowed_set]
+
+
+def _lmstudio_metadata_urls(openai_base_url):
+    """LM Studio native model lists, current v1 first and legacy v0 second."""
+    parts = urllib.parse.urlsplit(openai_base_url.rstrip("/"))
+    path = parts.path.rstrip("/")
+    if path.endswith("/v1"):
+        path = path[:-3]
+    base = path.rstrip("/")
+    make_url = lambda suffix: urllib.parse.urlunsplit(
+        (parts.scheme, parts.netloc, base + suffix, "", ""))
+    return [make_url("/api/v1/models"), make_url("/api/v0/models")]
+
+
+def _lmstudio_chat_models(openai_base_url, api_key, timeout, fallback_ids):
+    """Return metadata-filtered ids, falling back on older LM Studio builds."""
+    for endpoint in _lmstudio_metadata_urls(openai_base_url):
+        req = urllib.request.Request(endpoint)
+        if api_key:
+            req.add_header("Authorization", f"Bearer {api_key}")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as res:
+                metadata = json.loads(res.read().decode("utf-8", errors="replace"))
+        except Exception:
+            continue
+        rows = metadata.get("models") if isinstance(metadata, dict) else None
+        if not isinstance(rows, list) and isinstance(metadata, dict):
+            rows = metadata.get("data")
+        if isinstance(rows, list):
+            return _filter_lmstudio_chat_models(fallback_ids, metadata)
+    return list(fallback_ids)
+
+
 def discover_local_models(timeout=0.8):
     """Model ids from LLM servers running on THIS machine.
 
@@ -327,10 +414,10 @@ def discover_local_models(timeout=0.8):
             req = urllib.request.Request(url.rstrip("/") + "/models")
             with urllib.request.urlopen(req, timeout=timeout) as res:
                 data = json.loads(res.read().decode("utf-8", errors="replace"))
-            for m in data.get("data", []) or []:
-                mid = m.get("id") if isinstance(m, dict) else None
-                if mid and mid not in ids:
-                    ids.append(mid)
+            found = _model_ids(data)
+            if url == PRESET_BASE_URLS["lmstudio"]:
+                found = _lmstudio_chat_models(url, "", timeout, found)
+            ids.extend(mid for mid in found if mid not in ids)
         except Exception:
             continue
     _MODEL_CACHE["at"] = now
@@ -430,11 +517,9 @@ def probe_backend(backend, base_url, api_key, cli_command, timeout=6.0):
                 "detail": f"{url} 에 연결하지 못했습니다 ({type(exc).__name__}). "
                           f"서버가 켜져 있고 주소가 맞는지 확인하세요."}
 
-    models = []
-    for m in (payload.get("data") or []):
-        mid = m.get("id") if isinstance(m, dict) else None
-        if mid and mid not in models:
-            models.append(mid)
+    models = _model_ids(payload)
+    if normalize_backend(backend) == "lmstudio":
+        models = _lmstudio_chat_models(url, key, timeout, models)
     return {"ok": True, "kind": "http", "models": models, "target": url,
             "detail": f"모델 {len(models)}개 확인됨"}
 
