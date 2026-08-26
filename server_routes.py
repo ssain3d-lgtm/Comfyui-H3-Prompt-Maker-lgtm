@@ -19,7 +19,7 @@ from .h3_prompts import build_system_prompt, nearest_grid_frames
 from .llm_backends import (
     AUTO_MODEL, BACKEND_NAMES, LLMError, PRESET_BASE_URLS, PRESET_CLI_COMMANDS,
     THINKING_MODES, UNLOAD_MODES, call_llm, clamp_max_tokens, discover_local_models,
-    normalize_backend, probe_backend, warm_up_model,
+    normalize_backend, probe_backend, resolve_backend, warm_up_model,
 )
 
 PREFIX = "/h3_prompt_maker"
@@ -273,6 +273,27 @@ def register(routes):
         # A CLI backend takes stdin only, so pictures cannot travel with it.
         send_images = (images + sheets) if not cfg["backend"].endswith("_cli") else []
 
+        # If the last run was told to unload, the model is not in memory any
+        # more. Ollama and LM Studio's JIT loading would fetch it on the real
+        # call, but only as a side effect: LM Studio with JIT switched off
+        # answers 404 instead, and where it does work the load happens inside
+        # the generation with nothing distinguishing it from a slow model.
+        # Loading it first makes the reload something this code does, and lets
+        # the failure say which half went wrong.
+        warm_note = None
+        if cfg["unload_after"] != "keep" and not cfg["backend"].endswith("_cli"):
+            try:
+                _k, _u, warm_model, _c = resolve_backend(
+                    cfg["backend"], cfg["base_url"], cfg["model"], "", cfg["server_model"])
+            except Exception:  # noqa: BLE001 — the real call reports it better
+                warm_model = ""
+            if warm_model:
+                warm = warm_up_model(cfg["backend"], cfg["base_url"], cfg["api_key"], warm_model)
+                # A failure here is not fatal: the real call may still succeed,
+                # and if it does not, its own error is the more accurate one.
+                if not warm.get("ok"):
+                    warm_note = warm.get("detail")
+
         try:
             text = call_llm(
                 cfg["backend"], cfg["base_url"], cfg["model"], cfg["api_key"], cfg["cli_command"],
@@ -283,7 +304,13 @@ def register(routes):
                 audios_base64=audios if not cfg["backend"].endswith("_cli") else None,
             )
         except LLMError as exc:
-            return _json({"error": str(exc), "reason": "transient"}, status=502)
+            detail = str(exc)
+            if warm_note:
+                detail = (f"{detail}\n\n모델을 먼저 올려보려 했지만 실패했습니다: {warm_note}\n"
+                          f"'생성 후'가 언로드로 설정돼 있어 모델이 메모리에서 내려가 있을 수 있습니다. "
+                          f"LM Studio라면 JIT 모델 로딩이 켜져 있는지 확인하거나, "
+                          f"⚙️ 모델 연결에서 '모델 로드'를 한 번 누르세요.")
+            return _json({"error": detail, "reason": "transient"}, status=502)
         except Exception as exc:  # noqa: BLE001 — the overlay must show something actionable
             traceback.print_exc()
             return _json({"error": f"{type(exc).__name__}: {exc}", "reason": "unknown"}, status=502)

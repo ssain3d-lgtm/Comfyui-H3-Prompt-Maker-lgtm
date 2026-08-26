@@ -72,6 +72,13 @@ UI 방식을 원하면 **MiniMax H3 Prompt Maker (UI) 🖥️** 를, 그래프�
 내려간 뒤에도 **프롬프트 생성을 누르면 마지막에 고른 모델이 자동으로 다시 올라갑니다.**
 따로 '모델 로드'를 누를 필요는 없고, 첫 요청이 그만큼 느려질 뿐입니다.
 
+이 재로드는 백엔드의 JIT 로딩에 기대지 않고 **이 코드가 직접** 합니다: `생성 후`가 유지가
+아니면 생성 직전에 1토큰 핑을 보내 모델을 먼저 올리고, 그다음에 진짜 요청을 보냅니다.
+Ollama처럼 알아서 올려주는 서버라면 결과는 같지만, **LM Studio에서 JIT 모델 로딩을 꺼 둔
+경우** 예전에는 다음 생성이 그냥 `404 Model not found`로 끝났습니다. 이제는 어느 쪽이
+실패했는지 구분해서 "JIT 로딩이 켜져 있는지 확인하거나 '모델 로드'를 누르세요"라고 알려줍니다.
+`유지`로 두면 이 핑을 아예 보내지 않으므로 왕복이 늘지 않습니다.
+
 LM Studio는 `ttl`, Ollama는 `keep_alive`로 처리합니다 — 둘 다 요청에 함께 실어 보내므로
 백엔드를 바꿔도 같은 드롭다운 하나로 동작합니다. 이 필드를 모르는 서버(llama.cpp·vLLM 등)가
 요청을 거부하면 그 필드만 빼고 자동으로 다시 보내니, 설정해 두어도 안전합니다.
@@ -214,6 +221,7 @@ python3 tests/test_routes.py    # 오버레이 HTTP 계층 — 경로 탈출 차
 python3 tests/test_system_prompt.py  # H3 시스템 프롬프트가 실제 요청에 실리는지 (가짜 LLM 서버로 본문 캡처)
 python3 tests/test_thinking.py       # thinking 모드가 실제 요청에 실리는지 + 거부 서버 폴백
 python3 tests/test_media_parts.py    # 시트·오디오의 실제 요청 바디와 거부 시 벗겨내는 순서
+python3 tests/test_unload_reload.py  # 언로드 → 다음 생성 때 재로드까지의 왕복
 python3 tools/check_bundle.py   # 커밋된 번들이 서빙 가능하고 외부 참조가 없는지
 ```
 
