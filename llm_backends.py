@@ -540,6 +540,12 @@ def warm_up_model(backend, base_url, api_key, model, timeout=180.0):
         _kind, url, _m, _c = resolve_backend(backend, base_url, model, "")
     except LLMError as exc:
         return {"ok": False, "detail": str(exc)}
+    key = resolve_api_key(api_key)
+    if normalize_backend(backend) == "lmstudio":
+        chat_models = _lmstudio_chat_models(url, key, min(timeout, 6.0), [model])
+        if model not in chat_models:
+            return {"ok": False,
+                    "detail": f"{model}은(는) 채팅 모델이 아닙니다 (mmproj/embedding 제외)."}
     body = {
         "model": model,
         "messages": [{"role": "user", "content": "ping"}],
@@ -547,7 +553,7 @@ def warm_up_model(backend, base_url, api_key, model, timeout=180.0):
         "temperature": 0,
     }
     try:
-        _post_json(url.rstrip("/") + "/chat/completions", body, resolve_api_key(api_key), timeout)
+        _post_json(url.rstrip("/") + "/chat/completions", body, key, timeout)
     except Exception as exc:
         return {"ok": False, "detail": f"{model} 로드 실패: {exc}"}
     return {"ok": True, "detail": f"{model} 메모리에 로드됨"}

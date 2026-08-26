@@ -58,6 +58,15 @@ eq("metadata URLs preserve a reverse-proxy prefix",
    L._lmstudio_metadata_urls("http://host:1234/local/v1"),
    ["http://host:1234/local/api/v1/models", "http://host:1234/local/api/v0/models"])
 
+original_filter = L._lmstudio_chat_models
+try:
+    L._lmstudio_chat_models = lambda *_args: []
+    blocked = L.warm_up_model(
+        "lmstudio", "http://127.0.0.1:1/v1", "", "projector@bf16", timeout=0.1)
+finally:
+    L._lmstudio_chat_models = original_filter
+eq("warm-up rejects a filtered projector", blocked["ok"], False)
+
 if failures:
     print("MODEL FILTER TESTS FAILED")
     for failure in failures:

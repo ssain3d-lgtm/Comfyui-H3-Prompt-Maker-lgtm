@@ -314,13 +314,15 @@ const openSettings = async (node) => {
   modelWrap.append(inputs.server_model, loadBtn);
   row("server_model", "모델", modelWrap);
 
-  const fillModels = (models) => {
+  const fillModels = (models, preserveSaved = true) => {
     inputs.server_model.textContent = "";
     inputs.server_model.append(new Option("(auto)", "(auto)"));
     for (const m of models) inputs.server_model.append(new Option(m, m));
     const saved = cfg.server_model && cfg.server_model !== "(auto)" ? cfg.server_model : cfg.model;
-    if (saved && !models.includes(saved)) inputs.server_model.append(new Option(`${saved} (저장된 값)`, saved));
-    inputs.server_model.value = saved || "(auto)";
+    if (preserveSaved && saved && !models.includes(saved)) {
+      inputs.server_model.append(new Option(`${saved} (저장된 값)`, saved));
+    }
+    inputs.server_model.value = saved && (preserveSaved || models.includes(saved)) ? saved : "(auto)";
   };
   fillModels(meta.models || []);
 
@@ -407,7 +409,9 @@ const openSettings = async (node) => {
         statusText.style.color = "#34d399";
         statusText.textContent = `● 연결됨 — ${r.detail}`;
         if (r.kind === "http") {
-          fillModels(r.models || []);
+          // A successful probe is authoritative. Do not reinsert a previously
+          // saved mmproj/embedding id after the backend filtered it out.
+          fillModels(r.models || [], false);
           loadBtn.disabled = false;
           loadBtn.style.opacity = "1";
         }
