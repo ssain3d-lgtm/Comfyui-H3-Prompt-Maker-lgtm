@@ -149,8 +149,8 @@ def _llm_settings(body):
         "max_tokens": clamp_max_tokens(llm.get("max_tokens")),
         "thinking": (str(llm.get("thinking") or "auto")
                      if str(llm.get("thinking") or "auto") in THINKING_MODES else "auto"),
-        "unload_after": (str(llm.get("unload_after") or "keep")
-                         if str(llm.get("unload_after") or "keep") in UNLOAD_MODES else "keep"),
+        "unload_after": (str(llm.get("unload_after") or "now")
+                         if str(llm.get("unload_after") or "now") in UNLOAD_MODES else "now"),
     }
 
 

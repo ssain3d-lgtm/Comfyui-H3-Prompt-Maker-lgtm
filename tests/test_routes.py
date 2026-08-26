@@ -67,6 +67,11 @@ eq("collect: missing keys are fine", R._collect({}, "a", "b"), [])
 d = R._llm_settings({})
 eq("llm: defaults to lmstudio", d["backend"], "lmstudio")
 eq("llm: default temperature", d["temperature"], 0.7)
+eq("llm: defaults to unloading immediately", d["unload_after"], "now")
+eq("llm: an explicit keep is preserved",
+   R._llm_settings({"llm": {"unload_after": "keep"}})["unload_after"], "keep")
+eq("llm: an invalid unload mode falls back to now",
+   R._llm_settings({"llm": {"unload_after": "later"}})["unload_after"], "now")
 eq("llm: unknown backend falls back", R._llm_settings({"llm": {"backend": "hax"}})["backend"], "lmstudio")
 eq("llm: v1 alias still resolves", R._llm_settings({"llm": {"backend": "openai_compatible"}})["backend"], "openai_compat")
 eq("llm: temperature is clamped high", R._llm_settings({"llm": {"temperature": 99}})["temperature"], 2.0)

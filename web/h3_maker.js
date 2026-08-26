@@ -41,7 +41,7 @@ const DEFAULT_LLM = {
   //  auto  the model's own default | off  suppress it | on  force it
   thinking: "auto",
   //  keep  stay resident | 5m  unload after five idle minutes | now  unload at once
-  unload_after: "keep",
+  unload_after: "now",
   /** Epoch ms of the last successful 연결 확인, 0 when never checked. */
   verifiedAt: 0,
 };
@@ -344,7 +344,7 @@ const openSettings = async (node) => {
     ["5m", "5분 유지 — 그 뒤 자동 언로드"],
     ["now", "즉시 언로드 — 생성이 끝나면 바로 내림"],
   ]) inputs.unload_after.append(new Option(label, value));
-  inputs.unload_after.value = cfg.unload_after || "keep";
+  inputs.unload_after.value = cfg.unload_after || "now";
   row("unload_after", "생성 후", inputs.unload_after);
 
   inputs.max_tokens = el("input", FIELD_STYLE, {
