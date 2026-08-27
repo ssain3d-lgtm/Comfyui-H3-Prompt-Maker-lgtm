@@ -12,7 +12,15 @@ it runs is not, and nothing else in the suite would notice if it started again.
 """
 import asyncio, importlib.util, json, pathlib, sys, threading, time, urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from aiohttp import web
+try:
+    from aiohttp import web
+except ModuleNotFoundError:  # pragma: no cover - environment problem, not a defect
+    # Never skip: a guard that quietly opts out is a guard that stops guarding,
+    # and this one is the only thing standing between a local generation and
+    # ComfyUI freezing for its duration. Say what to install and fail.
+    print("✗ aiohttp 가 필요합니다 — ComfyUI 가 쓰는 서버라 이 테스트도 씁니다.\n"
+          "  python3 -m pip install aiohttp")
+    raise SystemExit(1)
 
 PACK = pathlib.Path("/home/user/comfyui-h3-prompt-maker-lgtm-")
 sp = importlib.util.spec_from_file_location("h3l", PACK/"__init__.py", submodule_search_locations=[str(PACK)])
