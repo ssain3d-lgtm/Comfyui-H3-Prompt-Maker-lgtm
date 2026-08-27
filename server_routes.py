@@ -10,6 +10,8 @@ importable — running the tests, or importing the pack standalone — this is a
 no-op rather than an error.
 """
 
+import asyncio
+import functools
 import json
 import mimetypes
 import pathlib
@@ -172,6 +174,21 @@ async def _read_body(request, limit=MAX_BODY_BYTES):
     return b"".join(chunks)
 
 
+async def _offthread(fn, *args, **kwargs):
+    """Run a blocking call without stopping ComfyUI.
+
+    Everything this module reaches for — probe, warm-up, the generation itself,
+    model discovery — is synchronous urllib. Called directly from an `async def`
+    handler it holds the one event loop ComfyUI runs on for the whole duration:
+    measured at 3.01s against a deliberately slow stub, and a local 14B model
+    with a 60k token budget holds it for minutes. While it is held the websocket
+    drops ("Reconnecting…"), the queue stops, /view and /prompt hang and the
+    progress bar freezes — which reads as ComfyUI crashing, not as a slow model.
+    """
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, functools.partial(fn, *args, **kwargs))
+
+
 def register(routes):
     @routes.get(PREFIX + "/api/health")
     async def health(request):
@@ -185,7 +202,7 @@ def register(routes):
             "unload_modes": UNLOAD_MODES,
             "preset_base_urls": PRESET_BASE_URLS,
             "preset_cli_commands": PRESET_CLI_COMMANDS,
-            "models": discover_local_models(),
+            "models": await _offthread(discover_local_models),
         })
 
     @routes.post(PREFIX + "/api/probe")
@@ -196,7 +213,8 @@ def register(routes):
         except ValueError:
             body = {}
         cfg = _llm_settings({"llm": body})
-        return _json(probe_backend(cfg["backend"], cfg["base_url"], cfg["api_key"], cfg["cli_command"]))
+        return _json(await _offthread(probe_backend, cfg["backend"], cfg["base_url"],
+                                      cfg["api_key"], cfg["cli_command"]))
 
     @routes.post(PREFIX + "/api/load-model")
     async def load_model(request):
@@ -209,7 +227,8 @@ def register(routes):
         model = str(body.get("model") or "").strip()
         if cfg["backend"].endswith("_cli"):
             return _json({"ok": True, "detail": "CLI 백엔드는 미리 로드할 모델이 없습니다."})
-        return _json(warm_up_model(cfg["backend"], cfg["base_url"], cfg["api_key"], model))
+        return _json(await _offthread(warm_up_model, cfg["backend"], cfg["base_url"],
+                                      cfg["api_key"], model))
 
     @routes.post(PREFIX + "/api/edit-image")
     async def edit_image(request):
@@ -284,14 +303,16 @@ def register(routes):
             except Exception:  # noqa: BLE001 — the real call reports it better
                 warm_model = ""
             if warm_model:
-                warm = warm_up_model(cfg["backend"], cfg["base_url"], cfg["api_key"], warm_model)
+                warm = await _offthread(warm_up_model, cfg["backend"], cfg["base_url"],
+                                        cfg["api_key"], warm_model)
                 # A failure here is not fatal: the real call may still succeed,
                 # and if it does not, its own error is the more accurate one.
                 if not warm.get("ok"):
                     warm_note = warm.get("detail")
 
         try:
-            text = call_llm(
+            text = await _offthread(
+                call_llm,
                 cfg["backend"], cfg["base_url"], cfg["model"], cfg["api_key"], cfg["cli_command"],
                 system_prompt, user_text, images_base64=send_images,
                 temperature=cfg["temperature"], server_model=cfg["server_model"],
