@@ -32,7 +32,7 @@ TOKEN_MAP = {
 }
 
 
-def main(prompts_ts_path):
+def main(prompts_ts_path, out_override=None):
     src = open(prompts_ts_path, encoding="utf-8").read()
 
     def tokenize_and_unescape(t):
@@ -189,11 +189,14 @@ def nearest_grid_frames(duration_seconds):
         base=base, multiseg=multiseg, remake=remake, sh_h3=sh_h3, sh_custom=sh_custom,
         axes=axes, strengths=strengths,
     )
-    out_path.write_text(py, encoding="utf-8")
-    print(f"h3_prompts.py regenerated ({len(py)} chars) from {prompts_ts_path}")
+    target = pathlib.Path(out_override) if out_override else out_path
+    target.write_text(py, encoding="utf-8")
+    print(f"{target.name} regenerated ({len(py)} chars) from {prompts_ts_path}")
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 2:
+    if len(sys.argv) not in (2, 3):
         sys.exit(__doc__)
-    main(sys.argv[1])
+    # A second argument writes elsewhere, so a parity check does not have to
+    # overwrite the committed file to find out whether it matches.
+    main(sys.argv[1], sys.argv[2] if len(sys.argv) == 3 else None)

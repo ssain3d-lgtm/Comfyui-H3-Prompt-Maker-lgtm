@@ -22,7 +22,11 @@ except ModuleNotFoundError:  # pragma: no cover - environment problem, not a def
           "  python3 -m pip install aiohttp")
     raise SystemExit(1)
 
-PACK = pathlib.Path("/home/user/comfyui-h3-prompt-maker-lgtm-")
+# Relative to this file, like every other test here. This started life as a
+# throwaway script in a scratch directory and kept that directory's absolute
+# path when it was promoted into tests/ — green locally, FileNotFoundError
+# on any other machine, including CI.
+PACK = pathlib.Path(__file__).resolve().parent.parent
 sp = importlib.util.spec_from_file_location("h3l", PACK/"__init__.py", submodule_search_locations=[str(PACK)])
 m = importlib.util.module_from_spec(sp); sys.modules["h3l"] = m; sp.loader.exec_module(m)
 R = importlib.import_module("h3l.server_routes")

@@ -86,10 +86,17 @@ webapp = os.environ.get("H3_WEBAPP", "/home/user/minimax-h3-prompt-maker-google-
 prompts_ts = pathlib.Path(webapp) / "prompts.ts"
 print()
 if prompts_ts.is_file():
+    # Regenerate to a temp file, not over the committed one. Running the suite
+    # used to leave a dirty tree — and if the local webapp checkout happened to
+    # be on another branch, it silently replaced the committed prompts with
+    # that branch's and reported one ✗.
+    import tempfile
     before = (PACK / "h3_prompts.py").read_bytes()
-    subprocess.run([sys.executable, str(PACK / "tools" / "extract_prompts.py"), str(prompts_ts)],
-                   check=True, capture_output=True)
-    after = (PACK / "h3_prompts.py").read_bytes()
+    with tempfile.TemporaryDirectory() as tmp:
+        candidate = pathlib.Path(tmp) / "h3_prompts.py"
+        subprocess.run([sys.executable, str(PACK / "tools" / "extract_prompts.py"),
+                        str(prompts_ts), str(candidate)], check=True, capture_output=True)
+        after = candidate.read_bytes()
     same = before == after
     print(("  ✓ " if same else "  ✗ ") + f"웹앱 prompts.ts에서 재생성 시 바이트 동일 ({len(after):,} bytes)")
     bad += not same
