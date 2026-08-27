@@ -16,6 +16,7 @@ import os
 import shlex
 import subprocess
 import sys
+import urllib.parse
 import urllib.request
 import urllib.error
 import urllib.parse
@@ -36,7 +37,17 @@ def _post_json(url, payload, api_key, timeout):
             return json.loads(res.read().decode("utf-8", errors="replace"))
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")[:2000]
-        raise LLMError(f"LLM server returned HTTP {e.code}: {body}") from e
+        # The reply body is the fastest way to see why a local server said no,
+        # so it goes to the caller — but only for loopback. base_url arrives in
+        # a request body, and echoing a remote reply turns this route into a
+        # read primitive against anything the ComfyUI host can reach. For those,
+        # the status line goes back and the body stays in the console.
+        if is_local_target(url):
+            raise LLMError(f"LLM server returned HTTP {e.code}: {body}") from e
+        print(f"[h3_prompt_maker] HTTP {e.code} from {url}: {body}", flush=True)
+        raise LLMError(
+            f"LLM server returned HTTP {e.code}. 원격 주소라 응답 본문은 ComfyUI 콘솔에만 남깁니다."
+        ) from e
     except urllib.error.URLError as e:
         raise LLMError(f"Cannot reach LLM server at {url}: {e.reason}") from e
 
@@ -522,14 +533,43 @@ def discover_local_models(timeout=0.8):
     return list(ids)
 
 
+# The routes ride on ComfyUI's own server, which has no auth, and a workflow is
+# a file people share. So neither an HTTP body nor a saved widget is a safe
+# source for a command line: `shell=False` stops metacharacter chaining, but it
+# cannot stop `sh -c "..."`, which names the interpreter outright. What may run
+# is therefore fixed here — a preset, or a command the machine owner exported.
+CLI_COMMAND_ENV = "H3_CLI_COMMAND"
+
+
+def resolve_cli_command(backend, requested=""):
+    """The command that may actually run, ignoring whatever the caller asked for.
+
+    Presets are commands the user already installed and chose by name. custom_cli
+    runs only what is in $H3_CLI_COMMAND, which takes shell access to set — so a
+    shared workflow, or an unauthenticated POST, cannot pick the program.
+    """
+    backend = normalize_backend(backend)
+    preset = PRESET_CLI_COMMANDS.get(backend)
+    if preset:
+        return preset
+    allowed = os.environ.get(CLI_COMMAND_ENV, "").strip()
+    if allowed:
+        return allowed
+    asked = (requested or "").strip()
+    raise LLMError(
+        f"'{backend}'로 실행할 명령이 지정되지 않았습니다. 임의의 명령을 요청 본문에서 받아 "
+        f"실행하지 않기 위해, 사용자 지정 CLI는 환경변수 {CLI_COMMAND_ENV} 에 넣은 값만 씁니다 "
+        f"(ComfyUI를 시작하는 셸에서 export). 프리셋 백엔드(claude_cli / gemini_cli / codex_cli)는 "
+        f"그대로 쓸 수 있습니다."
+        + (f" 설정창에 적힌 '{asked[:60]}' 은(는) 무시되었습니다." if asked else "")
+    )
+
+
 def resolve_backend(backend, base_url, model, cli_command, server_model=AUTO_MODEL):
     """Turn the widget values into a concrete (kind, url, model, command)."""
     backend = normalize_backend(backend)
     if backend in CLI_BACKEND_LIST:
-        cmd = (cli_command or "").strip() or PRESET_CLI_COMMANDS.get(backend, "")
-        if not cmd:
-            raise LLMError(f"Backend '{backend}' needs cli_command (e.g. 'claude -p --output-format text').")
-        return ("cli", "", "", cmd)
+        return ("cli", "", "", resolve_cli_command(backend, cli_command))
     url = (base_url or "").strip() or PRESET_BASE_URLS.get(backend, "")
     if not url:
         raise LLMError(f"Backend '{backend}' needs base_url (an OpenAI-compatible /v1 address).")
@@ -539,10 +579,44 @@ def resolve_backend(backend, base_url, model, cli_command, server_model=AUTO_MOD
     return ("http", url, mdl, "")
 
 
-def resolve_api_key(api_key):
-    """Prefer the typed key, else the environment — so a shared workflow need not carry one."""
+HOST_ALLOWLIST_ENV = "H3_LLM_ALLOWED_HOSTS"
+_LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1", "[::1]", "0.0.0.0"}
+
+
+def is_local_target(url):
+    """True for a loopback address. Anything else is somebody else's machine."""
+    try:
+        host = (urllib.parse.urlsplit(url).hostname or "").lower()
+    except Exception:  # noqa: BLE001 — an unparseable URL is not local
+        return False
+    return host in _LOCAL_HOSTS
+
+
+def _host_allowed_for_env_key(url):
+    if is_local_target(url):
+        return True
+    try:
+        host = (urllib.parse.urlsplit(url).hostname or "").lower()
+    except Exception:  # noqa: BLE001
+        return False
+    allowed = [h.strip().lower() for h in os.environ.get(HOST_ALLOWLIST_ENV, "").split(",")]
+    return bool(host) and host in [h for h in allowed if h]
+
+
+def resolve_api_key(api_key, target_url=None):
+    """Prefer the typed key, else the environment — so a shared workflow need not carry one.
+
+    The environment fallback is deliberately NOT unconditional. base_url arrives
+    in the request body, so an unconditional fallback hands the user's real
+    OPENAI_API_KEY to whatever host a caller names, as an Authorization header.
+    An env key therefore travels only to loopback, or to a host the machine
+    owner listed in $H3_LLM_ALLOWED_HOSTS. A key typed into the dialog is the
+    user's explicit choice for that address and always travels.
+    """
     if (api_key or "").strip():
         return api_key.strip()
+    if target_url is not None and not _host_allowed_for_env_key(target_url):
+        return ""
     for var in ("OPENAI_API_KEY", "OPENROUTER_API_KEY", "GEMINI_API_KEY", "H3_LLM_API_KEY"):
         v = os.environ.get(var, "").strip()
         if v:
@@ -559,7 +633,7 @@ def call_llm(backend, base_url, model, api_key, cli_command, system_prompt,
     if kind == "cli":
         # A CLI runner has no template switch; the text token is all there is.
         return call_cli(cmd, system_prompt, apply_thinking(user_text, thinking), timeout=timeout)
-    api_key = resolve_api_key(api_key)
+    api_key = resolve_api_key(api_key, url)
     return call_openai_compatible(url, mdl, api_key, system_prompt, user_text,
                                   images_base64=images_base64, temperature=temperature,
                                    seed=seed, timeout=timeout, max_tokens=max_tokens,
@@ -600,7 +674,7 @@ def probe_backend(backend, base_url, api_key, cli_command, timeout=6.0):
 
     endpoint = url.rstrip("/") + "/models"
     req = urllib.request.Request(endpoint)
-    key = resolve_api_key(api_key)
+    key = resolve_api_key(api_key, url)
     if key:
         req.add_header("Authorization", f"Bearer {key}")
     try:
@@ -637,7 +711,7 @@ def warm_up_model(backend, base_url, api_key, model, timeout=180.0):
         _kind, url, _m, _c = resolve_backend(backend, base_url, model, "")
     except LLMError as exc:
         return {"ok": False, "detail": str(exc)}
-    key = resolve_api_key(api_key)
+    key = resolve_api_key(api_key, url)
     if normalize_backend(backend) == "lmstudio":
         chat_models = _lmstudio_chat_models(url, key, min(timeout, 6.0), [model])
         if model not in chat_models:
