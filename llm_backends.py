@@ -4,7 +4,10 @@ LLM backends for the H3 Prompt Maker nodes.
 Two families:
 - "openai_compatible": any server speaking the OpenAI chat-completions API
   (LM Studio, llama.cpp llama-server, Ollama /v1, vLLM, KoboldCpp,
-   OpenRouter, OpenAI, Gemini's OpenAI-compatible endpoint, ...)
+   OpenRouter, OpenAI, ...). The `gemini` preset points this family at
+   Google's own endpoint (generativelanguage.googleapis.com) — the same
+   Google models the H3 web app used — with the address, default model,
+   thinking mapping and GEMINI_API_KEY handling filled in.
 - "cli": any command-line model runner. The full prompt is piped to the
   command's stdin and stdout is taken as the answer
   (Claude Code: `claude -p --output-format text`, Gemini CLI: `gemini -p`, ...)
@@ -185,7 +188,11 @@ def call_openai_compatible(base_url, model, api_key, system_prompt, user_text,
                            max_tokens=DEFAULT_MAX_TOKENS, thinking="auto", unload_after="keep",
                            audios_base64=None, backend_name="openai_compat"):
     url = base_url.rstrip("/") + "/chat/completions"
-    user_text = apply_thinking(user_text, thinking)
+    gemini = is_gemini_target(base_url)
+    if not gemini:
+        # /no_think is a Qwen convention; on Gemini it would just land in the
+        # prompt as literal text. Gemini gets reasoning_effort below instead.
+        user_text = apply_thinking(user_text, thinking)
 
     if images_base64 or audios_base64:
         content = [{"type": "text", "text": user_text}]
@@ -214,10 +221,18 @@ def call_openai_compatible(base_url, model, api_key, system_prompt, user_text,
         payload["seed"] = int(seed)
     payload.update(unload_payload(unload_after, backend_name))
     if thinking in ("off", "on"):
-        # vLLM and recent LM Studio builds switch Qwen3's chat template with
-        # this. It is the reliable half of the switch where it is supported;
-        # the /no_think token already in user_text covers everywhere else.
-        payload["chat_template_kwargs"] = {"enable_thinking": thinking == "on"}
+        if gemini:
+            # Google's compatibility layer speaks reasoning_effort. "none"
+            # disables thinking where the model allows it (flash); a model that
+            # cannot (2.5-pro) rejects it with a 400 and the retry below sheds
+            # the field, which lands on the model's own default — same contract
+            # as chat_template_kwargs on servers that do not know it.
+            payload["reasoning_effort"] = "none" if thinking == "off" else "high"
+        else:
+            # vLLM and recent LM Studio builds switch Qwen3's chat template with
+            # this. It is the reliable half of the switch where it is supported;
+            # the /no_think token already in user_text covers everywhere else.
+            payload["chat_template_kwargs"] = {"enable_thinking": thinking == "on"}
 
     def post():
         return _post_json(url, payload, api_key, timeout)
@@ -233,7 +248,15 @@ def call_openai_compatible(base_url, model, api_key, system_prompt, user_text,
             break
         except LLMError as exc:
             msg = str(exc).lower()
-            optional = [k for k in ("chat_template_kwargs", "ttl", "keep_alive") if k in payload]
+            if gemini and "max_tokens" in payload and "max_tokens" in msg:
+                # The 60000 default is headroom for local reasoning models, but
+                # it sits above some Gemini models' output cap and Google
+                # rejects it by name. Dropping the field falls back to that
+                # model's own maximum — which is what the headroom meant.
+                del payload["max_tokens"]
+                continue
+            optional = [k for k in ("chat_template_kwargs", "ttl", "keep_alive",
+                                    "reasoning_effort") if k in payload]
             optional_rejected = ("400" in msg or "template" in msg or "extra" in msg
                                  or "unrecognized" in msg or "unknown" in msg)
             if optional and optional_rejected:
@@ -309,21 +332,41 @@ def call_cli(cli_command, system_prompt, user_text, timeout=600):
 
 AUTO_MODEL = "(auto)"
 
+# Google's Gemini API through its OpenAI-compatible endpoint — the same Google
+# models the H3 web app called, spoken in the chat dialect this file already
+# knows. Host is pinned here: key routing below trusts it by name.
+GEMINI_HOST = "generativelanguage.googleapis.com"
+GEMINI_BASE_URL = f"https://{GEMINI_HOST}/v1beta/openai"
+DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
+
+
+def is_gemini_target(url):
+    """True when `url` points at Google's Gemini API host."""
+    try:
+        return (urllib.parse.urlsplit(url or "").hostname or "").lower() == GEMINI_HOST
+    except Exception:  # noqa: BLE001 — an unparseable URL is not Gemini
+        return False
+
+
 # Backend presets — pick one and the standard address/command fills itself in.
 # (Same approach as ComfyUI-LLM-Hub: aliases share the OpenAI-compatible client,
 #  they only differ in the default port.)
-PRESET_BASE_URLS = {
+# Only these loopback servers are probed by discover_local_models. The gemini
+# preset stays out: it is remote and keyed, so probing it on every page load
+# would stall the UI and spend quota for nothing.
+LOCAL_PRESET_BASE_URLS = {
     "lmstudio": "http://127.0.0.1:1234/v1",
     "ollama": "http://127.0.0.1:11434/v1",
     "llamacpp": "http://127.0.0.1:8080/v1",
     "vllm": "http://127.0.0.1:8000/v1",
 }
+PRESET_BASE_URLS = {**LOCAL_PRESET_BASE_URLS, "gemini": GEMINI_BASE_URL}
 PRESET_CLI_COMMANDS = {
     "claude_cli": "claude -p --output-format text",
     "gemini_cli": "gemini -p",
     "codex_cli": "codex exec",
 }
-HTTP_BACKENDS = ["lmstudio", "ollama", "llamacpp", "vllm", "openai_compat"]
+HTTP_BACKENDS = ["lmstudio", "ollama", "llamacpp", "vllm", "gemini", "openai_compat"]
 CLI_BACKEND_LIST = ["claude_cli", "gemini_cli", "codex_cli", "custom_cli"]
 BACKEND_NAMES = HTTP_BACKENDS + CLI_BACKEND_LIST
 
@@ -351,6 +394,31 @@ def _model_ids(payload):
         if mid and mid not in ids:
             ids.append(mid)
     return ids
+
+
+# Everything Google's model list exposes that cannot hold a chat conversation:
+# embedders, image/video generators, TTS voices, the Live-API duplex models and
+# the native-audio variants. Offering one of these as the prompt model fails at
+# generate time with a shape error — the worst place to learn it.
+_GEMINI_NON_CHAT_MARKERS = ("embedding", "imagen", "image", "veo", "tts",
+                            "live", "audio", "aqa")
+
+
+def filter_gemini_chat_models(ids):
+    """Chat-capable Gemini/Gemma ids from Google's list, bare (no models/ prefix)."""
+    out = []
+    for mid in ids:
+        if not isinstance(mid, str):
+            continue
+        base = mid[len("models/"):] if mid.startswith("models/") else mid
+        low = base.lower()
+        if not low.startswith(("gemini", "gemma")):
+            continue
+        if any(marker in low for marker in _GEMINI_NON_CHAT_MARKERS):
+            continue
+        if base and base not in out:
+            out.append(base)
+    return out
 
 
 def _filter_lmstudio_chat_models(openai_ids, metadata):
@@ -517,13 +585,13 @@ def discover_local_models(timeout=0.8):
     if now - _MODEL_CACHE["at"] < _MODEL_CACHE_TTL:
         return list(_MODEL_CACHE["ids"])
     ids = []
-    for url in PRESET_BASE_URLS.values():
+    for url in LOCAL_PRESET_BASE_URLS.values():
         try:
             req = urllib.request.Request(url.rstrip("/") + "/models")
             with urllib.request.urlopen(req, timeout=timeout) as res:
                 data = json.loads(res.read().decode("utf-8", errors="replace"))
             found = _model_ids(data)
-            if url == PRESET_BASE_URLS["lmstudio"]:
+            if url == LOCAL_PRESET_BASE_URLS["lmstudio"]:
                 found = _lmstudio_chat_models(url, "", timeout, found)
             ids.extend(mid for mid in found if mid not in ids)
         except Exception:
@@ -576,6 +644,14 @@ def resolve_backend(backend, base_url, model, cli_command, server_model=AUTO_MOD
     mdl = model
     if server_model and server_model != AUTO_MODEL:
         mdl = server_model
+    if backend == "gemini" or is_gemini_target(url):
+        # Google's list endpoint says "models/gemini-2.5-flash" while the chat
+        # endpoint wants the bare id; and unlike a local server, an empty model
+        # here would 404 rather than mean "whatever is loaded".
+        mdl = (mdl or "").strip()
+        if mdl.startswith("models/"):
+            mdl = mdl[len("models/"):]
+        mdl = mdl or DEFAULT_GEMINI_MODEL
     return ("http", url, mdl, "")
 
 
@@ -595,6 +671,12 @@ def is_local_target(url):
 def _host_allowed_for_env_key(url):
     if is_local_target(url):
         return True
+    # The gemini preset's pinned host is Google's API itself — sending the
+    # GEMINI key there is that key's whole purpose, so it needs no allowlist
+    # entry. Only the host is trusted; the key chosen for it is Gemini's own
+    # (see _env_key_vars), never OPENAI_API_KEY.
+    if is_gemini_target(url):
+        return True
     try:
         host = (urllib.parse.urlsplit(url).hostname or "").lower()
     except Exception:  # noqa: BLE001
@@ -603,21 +685,31 @@ def _host_allowed_for_env_key(url):
     return bool(host) and host in [h for h in allowed if h]
 
 
+def _env_key_vars(target_url):
+    """Which env keys may serve `target_url`. Google's host gets Google's keys
+    only — a fallback that reached OPENAI_API_KEY first would send the wrong
+    vendor's key as a Bearer header and fail as a confusing 401."""
+    if target_url is not None and is_gemini_target(target_url):
+        return ("GEMINI_API_KEY", "GOOGLE_API_KEY", "H3_LLM_API_KEY")
+    return ("OPENAI_API_KEY", "OPENROUTER_API_KEY", "GEMINI_API_KEY", "H3_LLM_API_KEY")
+
+
 def resolve_api_key(api_key, target_url=None):
     """Prefer the typed key, else the environment — so a shared workflow need not carry one.
 
     The environment fallback is deliberately NOT unconditional. base_url arrives
     in the request body, so an unconditional fallback hands the user's real
     OPENAI_API_KEY to whatever host a caller names, as an Authorization header.
-    An env key therefore travels only to loopback, or to a host the machine
-    owner listed in $H3_LLM_ALLOWED_HOSTS. A key typed into the dialog is the
-    user's explicit choice for that address and always travels.
+    An env key therefore travels only to loopback, to Google's pinned Gemini
+    host, or to a host the machine owner listed in $H3_LLM_ALLOWED_HOSTS. A key
+    typed into the dialog is the user's explicit choice for that address and
+    always travels.
     """
     if (api_key or "").strip():
         return api_key.strip()
     if target_url is not None and not _host_allowed_for_env_key(target_url):
         return ""
-    for var in ("OPENAI_API_KEY", "OPENROUTER_API_KEY", "GEMINI_API_KEY", "H3_LLM_API_KEY"):
+    for var in _env_key_vars(target_url):
         v = os.environ.get(var, "").strip()
         if v:
             return v
@@ -682,6 +774,9 @@ def probe_backend(backend, base_url, api_key, cli_command, timeout=6.0):
             payload = json.loads(res.read().decode("utf-8", errors="replace"))
     except urllib.error.HTTPError as exc:
         hint = " API 키를 확인하세요." if exc.code in (401, 403) else ""
+        if exc.code in (401, 403) and is_gemini_target(url):
+            hint = (" Gemini API 키가 필요합니다 — https://aistudio.google.com/apikey 에서 "
+                    "발급해 API 키 칸에 넣거나 GEMINI_API_KEY 환경변수로 두세요.")
         return {"ok": False, "kind": "http", "models": [], "target": url,
                 "detail": f"HTTP {exc.code} {exc.reason}.{hint}"}
     except Exception as exc:
@@ -692,6 +787,8 @@ def probe_backend(backend, base_url, api_key, cli_command, timeout=6.0):
     models = _model_ids(payload)
     if normalize_backend(backend) == "lmstudio":
         models = _lmstudio_chat_models(url, key, timeout, models)
+    elif is_gemini_target(url):
+        models = filter_gemini_chat_models(models)
     return {"ok": True, "kind": "http", "models": models, "target": url,
             "detail": f"모델 {len(models)}개 확인됨"}
 
@@ -711,6 +808,10 @@ def warm_up_model(backend, base_url, api_key, model, timeout=180.0):
         _kind, url, _m, _c = resolve_backend(backend, base_url, model, "")
     except LLMError as exc:
         return {"ok": False, "detail": str(exc)}
+    if is_gemini_target(url):
+        # Nothing to page in on a cloud API — and the fallback below would
+        # spend a real (billable) completion request just to say so.
+        return {"ok": True, "detail": "Gemini는 클라우드 API라 미리 로드할 필요가 없습니다."}
     key = resolve_api_key(api_key, url)
     if normalize_backend(backend) == "lmstudio":
         chat_models = _lmstudio_chat_models(url, key, min(timeout, 6.0), [model])

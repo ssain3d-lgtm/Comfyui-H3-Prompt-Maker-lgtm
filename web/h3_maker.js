@@ -19,6 +19,7 @@ const DEFAULT_PRESETS = {
     ollama: "http://127.0.0.1:11434/v1",
     llamacpp: "http://127.0.0.1:8080/v1",
     vllm: "http://127.0.0.1:8000/v1",
+    gemini: "https://generativelanguage.googleapis.com/v1beta/openai",
   },
   cli: {
     claude_cli: "claude -p --output-format text",
@@ -253,6 +254,8 @@ const button = (text, kind) => {
 
 const openSettings = async (node) => {
   const cfg = { ...DEFAULT_LLM, ...readJson(node, "llm", {}) };
+  // Fallback order mirrors the server's BACKEND_NAMES (gemini sits inside
+  // DEFAULT_PRESETS.base, before openai_compat).
   let meta = { backends: [...Object.keys(DEFAULT_PRESETS.base), "openai_compat", "claude_cli", "custom_cli"],
                preset_base_urls: DEFAULT_PRESETS.base, preset_cli_commands: DEFAULT_PRESETS.cli, models: [] };
   try {
@@ -365,6 +368,7 @@ const openSettings = async (node) => {
   const applyBackend = (fillPreset) => {
     const b = inputs.backend.value;
     const isCli = b.endsWith("_cli");
+    const isGemini = b === "gemini";
     if (fillPreset) {
       const url = meta.preset_base_urls?.[b];
       if (url) inputs.base_url.value = url;
@@ -375,6 +379,12 @@ const openSettings = async (node) => {
     rows.api_key.style.display = isCli ? "none" : "grid";
     rows.cli_command.style.display = isCli ? "grid" : "none";
     rows.server_model.style.display = isCli ? "none" : "grid";
+    // A cloud API holds no VRAM here: there is nothing to pre-load or unload.
+    rows.unload_after.style.display = isGemini ? "none" : "grid";
+    loadBtn.style.display = isGemini ? "none" : "";
+    inputs.api_key.placeholder = isGemini
+      ? "GEMINI_API_KEY 환경변수 또는 aistudio.google.com/apikey 키"
+      : "";
     setUnverified("백엔드가 바뀌었습니다 — 연결을 다시 확인하세요.");
   };
 

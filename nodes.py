@@ -229,7 +229,9 @@ _BACKEND_INPUTS = {
         "default": "lmstudio",
         "tooltip": "lmstudio/ollama/llamacpp/vllm = local OpenAI-compatible servers on their "
                    "standard ports (1234/11434/8080/8000) — nothing else to type. "
-                   "openai_compat = any other OpenAI-compatible address (OpenRouter, Gemini, "
+                   "gemini = Google Gemini API (needs a GEMINI_API_KEY; model defaults to "
+                   "gemini-2.5-flash — the web app's Google models). "
+                   "openai_compat = any other OpenAI-compatible address (OpenRouter, "
                    "remote server) via base_url. claude_cli/gemini_cli/codex_cli = "
                    "subscription CLIs. custom_cli = your own stdin->stdout command."}),
     "base_url": ("STRING", {"default": "",
@@ -237,13 +239,14 @@ _BACKEND_INPUTS = {
                    "Fill in only for openai_compat or a non-standard port."}),
     "model": ("STRING", {"default": "",
         "tooltip": "Model name typed by hand. The server_model dropdown below wins "
-                   "when it is not (auto). Empty = the server's loaded/default model."}),
+                   "when it is not (auto). Empty = the server's loaded/default model "
+                   "(gemini backend: gemini-2.5-flash)."}),
     "api_key": ("STRING", {"default": "", "password": True,
-        "tooltip": "Only needed for paid endpoints (OpenRouter, OpenAI, Gemini). "
-                   "Local servers ignore it. Leave empty to read OPENAI_API_KEY / "
-                   "OPENROUTER_API_KEY from the environment instead — a key typed here "
-                   "is saved into the workflow JSON and into the metadata of every image "
-                   "made with it."}),
+        "tooltip": "Only needed for paid endpoints (Gemini, OpenRouter, OpenAI). "
+                   "Local servers ignore it. Leave empty to read the environment instead "
+                   "(gemini backend: GEMINI_API_KEY / GOOGLE_API_KEY; others: OPENAI_API_KEY / "
+                   "OPENROUTER_API_KEY) — a key typed here is saved into the workflow JSON "
+                   "and into the metadata of every image made with it."}),
     "cli_command": ("STRING", {"default": "",
         "tooltip": "CLI backends only. Leave empty to use the preset command "
                    "(claude -p --output-format text / gemini -p / codex exec); "
