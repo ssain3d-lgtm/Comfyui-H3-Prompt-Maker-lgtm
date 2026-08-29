@@ -174,13 +174,41 @@ SFW/NSFW · 참조 이미지(IMAGE, 최대 9장 — `<Picture N>` 라벨 자동 
 - `api_key`를 비워 두면 환경변수(`OPENAI_API_KEY` / `OPENROUTER_API_KEY` / `GEMINI_API_KEY` / `H3_LLM_API_KEY`)를 사용합니다.
   **위젯에 직접 입력한 키는 워크플로우 JSON과 그 워크플로우로 만든 모든 PNG 메타데이터에 저장되므로**, 공유할 계획이면 환경변수를 쓰세요.
 
+### `gemini` — Google Gemini API (프리셋, 웹앱이 쓰던 구글 모델)
+
+| backend | 자동 주소 | 비고 |
+|---|---|---|
+| `gemini` | `https://generativelanguage.googleapis.com/v1beta/openai` | [aistudio.google.com/apikey](https://aistudio.google.com/apikey)에서 무료 발급한 API 키 필요 |
+
+원래 웹앱이 Google AI Studio에서 호출하던 바로 그 Gemini 모델을, 같은 UI 그대로 씁니다.
+
+1. ⚙️ 모델 연결에서 백엔드를 `gemini`로 — 주소가 자동으로 채워집니다.
+2. API 키를 칸에 넣거나, ComfyUI를 띄우는 셸에서 `GEMINI_API_KEY`(또는 `GOOGLE_API_KEY`)로
+   export 해두세요. 이 프리셋의 주소는 구글 고정 호스트라서 환경변수 키가
+   `H3_LLM_ALLOWED_HOSTS` 등록 없이도 전송됩니다 (다른 원격 주소로는 여전히 나가지 않고,
+   구글 호스트에는 `OPENAI_API_KEY`가 아니라 Gemini 키만 갑니다).
+3. **🔌 연결 확인** — 계정에서 쓸 수 있는 Gemini/Gemma 채팅 모델 목록이 그대로 뜹니다
+   (임베딩·이미지·TTS·Live 모델은 목록에서 걸러냅니다). 모델을 비워 두면 `gemini-2.5-flash`.
+
+알아두실 점:
+
+- 참조 이미지는 비전을 기본 지원하는 Gemini에 그대로 전달됩니다. 오디오 클립은 옴니 입력을
+  받는 모델에서만 들리고, 거부되면 오디오만 빼고 자동 재시도합니다 (로컬 백엔드와 동일한 규약).
+- **thinking**: `off`/`on`은 Gemini에는 `/no_think` 토큰 대신 `reasoning_effort`(none/high)로
+  전달됩니다. 끌 수 없는 모델(2.5-pro 등)이 거부하면 그 필드만 빼고 자동 재시도합니다.
+- **max_tokens**: 기본 60000이 해당 모델의 출력 상한보다 크면 구글이 거부하는데, 그 경우
+  자동으로 상한 없이(모델 최대치) 다시 보냅니다.
+- **생성 후**(언로드)와 **모델 로드**는 클라우드 API에 해당 없음 — gemini에서는 숨겨집니다.
+- 무료 등급은 분당/일일 요청 한도가 있습니다: [rate limits](https://ai.google.dev/gemini-api/docs/rate-limits)
+
 ### `openai_compat` — 그 외 OpenAI 호환 주소 (base_url 직접 입력)
 
 | 대상 | base_url | 비고 |
 |---|---|---|
 | OpenRouter | `https://openrouter.ai/api/v1` | api_key 필요 |
-| Gemini (OpenAI 호환) | `https://generativelanguage.googleapis.com/v1beta/openai` | api_key 필요 — 웹앱과 동일 품질 |
 | OpenAI / KoboldCpp / 원격 서버 | 각 주소 | OpenAI 호환이면 전부 동작 |
+
+Gemini는 base_url을 직접 칠 필요 없이 위의 `gemini` 프리셋을 쓰면 됩니다.
 
 ### CLI 백엔드 (구독 CLI 모델)
 
