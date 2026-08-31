@@ -24,4 +24,5 @@ jobs:
       # The overlay is a committed build artifact, so it can silently go stale.
       # This does not rebuild it (that needs the web app checkout) — it checks
       # that what is committed is servable and self-contained.
+      - run: node tests/test_node_face.mjs
       - run: python3 tools/check_bundle.py

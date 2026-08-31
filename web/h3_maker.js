@@ -89,12 +89,59 @@ const resize = (node) => {
 };
 
 /** One line describing where generation will go, for the node face. */
+/**
+ * The part of a model id worth showing on the node face.
+ *
+ * LM Studio ids are repository paths, and a quantised community build runs to
+ * well over a hundred characters:
+ *   aiconjured/qwen3.8-27b-uncensored-…-gguf-q8-nvfp4/qwen3.8-…-mixed.gguf
+ * The leading directories are the publisher and the repo, which repeat the file
+ * name; the file name is the part that identifies the build. Keep that.
+ */
+const modelLabel = (id) => {
+  const text = String(id || "").trim();
+  if (!text) return "(auto)";
+  const parts = text.split("/").filter(Boolean);
+  return parts.length ? parts[parts.length - 1] : text;
+};
+
+/**
+ * Shorten to fit, cutting from the middle.
+ *
+ * The node face is fixed width and fillText does not clip, so a long name ran
+ * straight out over the canvas and across whatever sat to the right. Cutting
+ * the tail would be worse than useless here: the head is the family
+ * (qwen3.8-27b) and the tail is the quantisation (nvfp4-mixed.gguf), and you
+ * need both to know which build is loaded.
+ */
+const fitText = (ctx, text, maxWidth) => {
+  if (maxWidth <= 0) return "";
+  if (ctx.measureText(text).width <= maxWidth) return text;
+  const ell = "…";
+  // The marker is itself wider than a latin character, so on a node squeezed
+  // very narrow even it does not fit — and returning it anyway overflowed.
+  if (ctx.measureText(ell).width > maxWidth) return "";
+  let lo = 0;
+  let hi = text.length;
+  // Largest total length that still fits, found by bisection so a 200-char id
+  // costs ~8 measureText calls per frame rather than 200.
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2);
+    const head = Math.ceil(mid / 2);
+    const candidate = text.slice(0, head) + ell + text.slice(text.length - (mid - head));
+    if (ctx.measureText(candidate).width <= maxWidth) lo = mid; else hi = mid - 1;
+  }
+  if (lo <= 0) return ell;
+  const head = Math.ceil(lo / 2);
+  return text.slice(0, head) + ell + text.slice(text.length - (lo - head));
+};
+
 const describeConn = (llm) => {
   const cfg = { ...DEFAULT_LLM, ...(llm || {}) };
   if (!llm || Object.keys(llm).length === 0) return { text: "모델 미설정", ok: false };
   const model = cfg.server_model && cfg.server_model !== "(auto)" ? cfg.server_model : (cfg.model || "(auto)");
   const verified = cfg.verifiedAt ? "● " : "○ ";
-  return { text: `${verified}${cfg.backend} · ${model}`, ok: Boolean(cfg.verifiedAt) };
+  return { text: `${verified}${cfg.backend} · ${modelLabel(model)}`, ok: Boolean(cfg.verifiedAt) };
 };
 
 /**
@@ -547,13 +594,17 @@ app.registerExtension({
       ctx.font = "11px ui-sans-serif, system-ui, sans-serif";
 
       // Connection first, then what is loaded: the order you need them in.
+      // 12px of padding each side. Both lines are clipped, not just the model
+      // one: a long status can overflow too.
+      const room = this.size[0] - 24;
+
       const conn = this.h3Conn || { text: "모델 미설정", ok: false };
       ctx.fillStyle = conn.ok ? "#34d399" : "#8b949e";
-      ctx.fillText(conn.text, 12, this.size[1] - FOOTER_H + 14);
+      ctx.fillText(fitText(ctx, conn.text, room), 12, this.size[1] - FOOTER_H + 14);
 
       const status = this.h3Status || "적용된 프롬프트 없음";
       ctx.fillStyle = status.startsWith("✓") ? "#34d399" : "#8b949e";
-      ctx.fillText(status, 12, this.size[1] - FOOTER_H + 31);
+      ctx.fillText(fitText(ctx, status, room), 12, this.size[1] - FOOTER_H + 31);
       ctx.restore();
     };
 
