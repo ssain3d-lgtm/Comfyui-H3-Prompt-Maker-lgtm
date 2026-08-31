@@ -10,6 +10,7 @@ request translation that decides what the LLM is actually asked.
 import importlib.util
 import json
 import pathlib
+import re
 import sys
 
 # server_routes uses package-relative imports, as a ComfyUI custom node must.
@@ -267,6 +268,23 @@ _js = (_PACK / "web" / "h3_maker.js").read_text(encoding="utf-8")
 ok("thinking: the dialog offers the three modes",
    'inputs.thinking' in _js and '"off"' in _js and '"on"' in _js)
 ok("thinking: and saves the choice", 'thinking: inputs.thinking.value' in _js)
+
+# --- one repository name, everywhere ----------------------------------------
+# The repo was reachable under two spellings for a while (GitHub redirects a
+# renamed repo), so the README, pyproject and the web app's prompts.ts drifted
+# apart. A redirect is not forever: it breaks the day someone registers the old
+# name. The clone URL in the README is also the folder name a user ends up with
+# under custom_nodes, so it is the one that has to be right.
+REPO_NAME = "Comfyui-H3-Prompt-Maker-lgtm"
+for _rel in ("README.md", "pyproject.toml"):
+    _text = (_PACK / _rel).read_text(encoding="utf-8")
+    _urls = re.findall(r"github\.com/ssain3d-lgtm/([A-Za-z0-9._-]+?)(?:\.git)?(?=[\s\)\"'<]|$)", _text)
+    # Only the URLs that point at THIS pack — the README also links the web app
+    # repo the overlay and prompts are extracted from, which is a different one.
+    _mine = {u for u in _urls if "lgtm" in u.lower() and "h3-prompt-maker" in u.lower()}
+    ok(f"repo: {_rel} links this pack at all", bool(_mine), f"found {_urls}")
+    for _name in _mine:
+        eq(f"repo: {_rel} spells it {REPO_NAME}", _name, REPO_NAME)
 
 # --- constants the frontend relies on ---------------------------------------
 eq("prefix matches the app's API_BASE", R.PREFIX + "/api", "/h3_prompt_maker/api")
