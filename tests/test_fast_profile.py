@@ -25,6 +25,9 @@ checks = {
         "detailed_description:", "overall_soundscape:", "non_diegetic_music:")),
     "frame grid survives": "17k+5" in fast and "362" in fast,
     "one-shot rule survives": "Do not ask questions" in fast,
+    # Small models copy the Korean request template's bullet headers into the
+    # output; the Full profile forbids it and the Fast profile must too.
+    "korean template-header rule survives": '"[1] 장면:"' in fast and "Never echo" in fast,
 }
 
 failed = [name for name, ok in checks.items() if not ok]

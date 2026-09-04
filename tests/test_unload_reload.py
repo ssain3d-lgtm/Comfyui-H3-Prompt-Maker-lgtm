@@ -74,9 +74,11 @@ class Server(BaseHTTPRequestHandler):
         drop = keep == 0
         out = {"choices": [{"message": {"content":
             "subject_definitions: a\nsummary: b\ndetailed_description: c"}}]}
-        self._send(200, out)
+        # Clear before answering: the client resumes the moment the response
+        # lands, and a state change after that raced the next assertion.
         if drop:
             state["loaded"] = None
+        self._send(200, out)
 
     def _send(self, code, payload):
         b = json.dumps(payload).encode()
@@ -195,10 +197,10 @@ class FakeReq:
         return It()
 
 
-def via_route(unload):
+def via_route(unload, backend="lmstudio"):
     log.clear()
     body = {"promptText": "골목", "minimaxStyle": "ref2va", "duration": 10,
-            "llm": {"backend": "lmstudio", "base_url": URL, "model": MODEL,
+            "llm": {"backend": backend, "base_url": URL, "model": MODEL,
                     "api_key": "", "cli_command": "", "temperature": 0.7,
                     "max_tokens": 60000, "thinking": "auto", "unload_after": unload}}
     routes = []
@@ -248,6 +250,15 @@ state["loaded"], state["jit"] = None, True
 out, seq = via_route("close")
 eq("route: close mode loads once and keeps the model for retries", seq, ["load", "gen"])
 eq("route: close mode remains resident before the UI closes", state["loaded"], MODEL)
+
+# llama.cpp and vLLM cannot be unloaded by anything this pack sends, so the
+# warm-up ping before each generation was a wasted request — and on llama.cpp
+# one that evicts the prompt cache the previous prefill left behind.
+for resident in ("llamacpp", "vllm"):
+    state["loaded"], state["jit"] = MODEL, True
+    out, seq = via_route("close", backend=resident)
+    eq(f"route: {resident} + close skips the pointless warm-up", seq, ["gen"])
+    ok(f"route: {resident} still answers", "subject_definitions" in out.get("result", ""))
 unloaded = L.unload_model("lmstudio", URL, "", MODEL)
 eq("close: explicit unload reports success", unloaded["ok"], True)
 eq("close: explicit unload releases VRAM", state["loaded"], None)

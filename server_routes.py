@@ -203,10 +203,19 @@ def _selected_model(cfg):
         return ""
 
 
+#: Servers whose process *is* the model: nothing this pack sends can unload
+#: them, so a model that answered once is still there and a pre-flight ping
+#: only costs a request — on llama.cpp it can also evict the prompt cache
+#: that made the previous prefill cheap.
+_ALWAYS_RESIDENT_BACKENDS = {"llamacpp", "vllm"}
+
+
 async def _warm_for_generation(cfg):
     """Ensure modes that can unload have a resident model and time the check/load."""
     if cfg["unload_after"] == "keep" or cfg["backend"].endswith("_cli"):
         return None, {"load_ms": 0.0, "load_detail": "model kept resident"}
+    if normalize_backend(cfg["backend"]) in _ALWAYS_RESIDENT_BACKENDS:
+        return None, {"load_ms": 0.0, "load_detail": "server process owns the model"}
     model = _selected_model(cfg)
     if not model:
         return None, {"load_ms": 0.0, "load_detail": "automatic model selection"}
