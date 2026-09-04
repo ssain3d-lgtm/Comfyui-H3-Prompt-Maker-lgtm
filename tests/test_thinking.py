@@ -64,6 +64,8 @@ ok("reject: /no_think still carries the intent", calls[1]["messages"][1]["conten
 REJECT["on"] = False
 # --- what happens to the model after the answer -----------------------------
 ok("keep: no time-to-live sent", L.unload_payload("keep", "lmstudio") == {})
+ok("close: generation keeps the model resident until the explicit close call",
+   L.unload_payload("close", "lmstudio") == {})
 ok("5m: LM Studio receives only ttl",
    L.unload_payload("5m", "lmstudio") == {"ttl": 300}, L.unload_payload("5m", "lmstudio"))
 ok("now: LM Studio receives only the ttl compatibility fallback",
