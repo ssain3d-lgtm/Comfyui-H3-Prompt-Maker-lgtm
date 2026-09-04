@@ -244,6 +244,14 @@ out, seq = via_route("5m")
 eq("route: 5m warms up too — the model may have aged out", seq, ["load", "gen"])
 eq("route: and 5m leaves it loaded", state["loaded"], MODEL)
 
+state["loaded"], state["jit"] = None, True
+out, seq = via_route("close")
+eq("route: close mode loads once and keeps the model for retries", seq, ["load", "gen"])
+eq("route: close mode remains resident before the UI closes", state["loaded"], MODEL)
+unloaded = L.unload_model("lmstudio", URL, "", MODEL)
+eq("close: explicit unload reports success", unloaded["ok"], True)
+eq("close: explicit unload releases VRAM", state["loaded"], None)
+
 # Native load/unload must not depend on JIT being enabled.
 state["loaded"], state["jit"] = None, False
 out, seq = via_route("now")

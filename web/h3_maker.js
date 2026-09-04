@@ -29,6 +29,7 @@ const DEFAULT_PRESETS = {
 };
 
 const DEFAULT_LLM = {
+  settings_version: 2,
   backend: "lmstudio",
   base_url: "",
   model: "",
@@ -40,9 +41,11 @@ const DEFAULT_LLM = {
   // Qwen3-class model emitting one line of assumptions as its "answer".
   max_tokens: 60000,
   //  auto  the model's own default | off  suppress it | on  force it
-  thinking: "auto",
-  //  keep  stay resident | 5m  unload after five idle minutes | now  unload at once
-  unload_after: "now",
+  thinking: "off",
+  //  fast  compact render-critical guide | full  complete reference manual
+  prompt_profile: "fast",
+  //  close  stay resident for retries, then unload when this overlay closes
+  unload_after: "close",
   /** Epoch ms of the last successful 연결 확인, 0 when never checked. */
   verifiedAt: 0,
 };
@@ -57,6 +60,28 @@ const readJson = (node, name, fallback) => parse(widget(node, name)?.value ?? ""
 const writeJson = (node, name, value) => {
   const w = widget(node, name);
   if (w) w.value = JSON.stringify(value);
+};
+
+/**
+ * Move pre-optimization workflows onto the fast defaults once.
+ *
+ * Old nodes serialized `thinking:auto` and `unload_after:now`, so merely
+ * changing DEFAULT_LLM would leave every existing workflow on the slow path.
+ * Explicit choices made after this release carry settings_version=2 and are
+ * preserved verbatim, including users who intentionally choose auto/now.
+ */
+const readLlm = (node) => {
+  const saved = readJson(node, "llm", {});
+  if (Number(saved.settings_version) >= 2) return { ...DEFAULT_LLM, ...saved };
+  const migrated = {
+    ...saved,
+    settings_version: 2,
+    thinking: !saved.thinking || saved.thinking === "auto" ? "off" : saved.thinking,
+    prompt_profile: saved.prompt_profile || "fast",
+    unload_after: !saved.unload_after || saved.unload_after === "now" ? "close" : saved.unload_after,
+  };
+  if (Object.keys(saved).length > 0) writeJson(node, "llm", migrated);
+  return { ...DEFAULT_LLM, ...migrated };
 };
 
 /** Room reserved under the widgets for the two status lines drawn by hand. */
@@ -227,8 +252,31 @@ const ensureOverlay = () => {
 };
 
 const hideOverlay = () => {
+  const node = overlayNode;
+  // Closing the UI must also stop an active browser fetch. The rebuilt iframe
+  // turns this host message into AbortController.abort().
+  sendToOverlay("host-close", null);
   if (overlay) overlay.root.style.display = "none";
   overlayNode = null;
+  if (!node) return;
+  const cfg = readLlm(node);
+  // Give the iframe's AbortController a moment to close the active upstream
+  // stream before asking LM Studio/Ollama to evict the model.
+  if (cfg.unload_after === "close") setTimeout(() => void requestModelUnload(cfg), 300);
+};
+
+const requestModelUnload = async (cfg) => {
+  const model = cfg.server_model && cfg.server_model !== "(auto)" ? cfg.server_model : cfg.model;
+  if (!model || cfg.backend?.endsWith("_cli") || cfg.backend === "gemini") return null;
+  try {
+    const res = await fetch(`${PREFIX}/api/unload-model`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ...cfg, model, server_model: model }),
+    });
+    return await res.json();
+  } catch (error) {
+    return { ok: false, detail: error?.message || String(error) };
+  }
 };
 
 const sendToOverlay = (type, payload) => {
@@ -246,7 +294,7 @@ const openOverlay = (node) => {
 };
 
 const pushNodeState = (node) => {
-  sendToOverlay("llm", { ...DEFAULT_LLM, ...readJson(node, "llm", {}) });
+  sendToOverlay("llm", readLlm(node));
   sendToOverlay("state", readJson(node, "state", {}));
 };
 
@@ -300,7 +348,7 @@ const button = (text, kind) => {
 };
 
 const openSettings = async (node) => {
-  const cfg = { ...DEFAULT_LLM, ...readJson(node, "llm", {}) };
+  const cfg = readLlm(node);
   // Fallback order mirrors the server's BACKEND_NAMES (gemini sits inside
   // DEFAULT_PRESETS.base, before openai_compat).
   let meta = { backends: [...Object.keys(DEFAULT_PRESETS.base), "openai_compat", "claude_cli", "custom_cli"],
@@ -318,7 +366,7 @@ const openSettings = async (node) => {
     width: "min(520px, 94vw)", background: "#161b22", border: "1px solid #30363d",
     borderRadius: "12px", padding: "18px", color: "#c9d1d9",
     font: "13px/1.5 ui-sans-serif, system-ui, sans-serif",
-    display: "flex", flexDirection: "column", gap: "10px",
+    display: "flex", flexDirection: "column", gap: "10px", maxHeight: "92vh", overflowY: "auto",
   });
   box.append(el("div", { font: "700 14px/1 inherit" }, { textContent: "⚙️ 모델 연결" }));
 
@@ -359,9 +407,12 @@ const openSettings = async (node) => {
   const modelWrap = el("div", { display: "flex", gap: "6px" });
   inputs.server_model = el("select", FIELD_STYLE);
   const loadBtn = button("모델 로드", "ghost");
+  const unloadBtn = button("언로드", "ghost");
   loadBtn.disabled = true;
   loadBtn.style.opacity = "0.5";
-  modelWrap.append(inputs.server_model, loadBtn);
+  unloadBtn.disabled = true;
+  unloadBtn.style.opacity = "0.5";
+  modelWrap.append(inputs.server_model, loadBtn, unloadBtn);
   row("server_model", "모델", modelWrap);
 
   const fillModels = (models, preserveSaved = true) => {
@@ -379,22 +430,31 @@ const openSettings = async (node) => {
   inputs.temperature = el("input", FIELD_STYLE, { type: "number", step: "0.05", min: "0", max: "2", value: cfg.temperature });
   row("temperature", "temperature", inputs.temperature);
 
+  inputs.prompt_profile = el("select", FIELD_STYLE);
+  for (const [value, label] of [
+    ["fast", "Fast — 핵심 H3 규칙만 (권장)"],
+    ["full", "Full — 전체 가이드 (정밀/디버그)"],
+  ]) inputs.prompt_profile.append(new Option(label, value));
+  inputs.prompt_profile.value = cfg.prompt_profile || "fast";
+  row("prompt_profile", "프롬프트", inputs.prompt_profile);
+
   inputs.thinking = el("select", FIELD_STYLE);
   for (const [value, label] of [
     ["auto", "auto — 모델 기본값"],
     ["off", "off — 사고 끄기 (예산 전부를 답변에)"],
     ["on", "on — 사고 켜기"],
   ]) inputs.thinking.append(new Option(label, value));
-  inputs.thinking.value = cfg.thinking || "auto";
+  inputs.thinking.value = cfg.thinking || "off";
   row("thinking", "thinking", inputs.thinking);
 
   inputs.unload_after = el("select", FIELD_STYLE);
   for (const [value, label] of [
     ["keep", "유지 — 다음 생성이 가장 빠름 (VRAM 점유)"],
+    ["close", "창 닫을 때 언로드 — 재생성은 빠르게 (권장)"],
     ["5m", "5분 유지 — 그 뒤 자동 언로드"],
     ["now", "즉시 언로드 — 생성이 끝나면 바로 내림"],
   ]) inputs.unload_after.append(new Option(label, value));
-  inputs.unload_after.value = cfg.unload_after || "now";
+  inputs.unload_after.value = cfg.unload_after || "close";
   row("unload_after", "생성 후", inputs.unload_after);
 
   inputs.max_tokens = el("input", FIELD_STYLE, {
@@ -404,7 +464,8 @@ const openSettings = async (node) => {
   const tokenHint = el("p", { margin: "-4px 0 0 104px", fontSize: "11px", color: "#8b949e", lineHeight: "1.5" }, {
     textContent: "thinking: Qwen3 같은 추론 모델은 답하기 전에 max_tokens 예산을 생각하는 데 씁니다. "
                + "off로 두면 그 예산이 전부 답변으로 갑니다 (/no_think + 템플릿 스위치, 모르는 서버는 무시). "
-               + "생성 후: 모델을 유지할지 내릴지. LM Studio는 공식 load/unload API로 다시 올리고 실제로 내립니다. "
+               + "Fast 프롬프트는 출력 형식과 렌더 핵심 규칙만 보내 입력 처리를 줄입니다. "
+               + "생성 후 '창 닫을 때'는 재생성 동안 유지하고 적용/닫기 때 VRAM에서 내립니다. "
                + "Ollama는 keep_alive를 사용합니다. llama.cpp·vLLM은 프로세스가 곧 모델이라 해당 없음. "
                + "max_tokens: 너무 낮으면 본문 없이 한 줄만 돌아옵니다. 기본 60000.",
   });
@@ -429,6 +490,7 @@ const openSettings = async (node) => {
     // A cloud API holds no VRAM here: there is nothing to pre-load or unload.
     rows.unload_after.style.display = isGemini ? "none" : "grid";
     loadBtn.style.display = isGemini ? "none" : "";
+    unloadBtn.style.display = isGemini ? "none" : "";
     inputs.api_key.placeholder = isGemini
       ? "GEMINI_API_KEY 환경변수 또는 aistudio.google.com/apikey 키"
       : "";
@@ -440,6 +502,8 @@ const openSettings = async (node) => {
     verified = false;
     loadBtn.disabled = true;
     loadBtn.style.opacity = "0.5";
+    unloadBtn.disabled = true;
+    unloadBtn.style.opacity = "0.5";
     statusText.style.color = "#8b949e";
     statusText.textContent = why;
   };
@@ -471,6 +535,8 @@ const openSettings = async (node) => {
           fillModels(r.models || [], false);
           loadBtn.disabled = false;
           loadBtn.style.opacity = "1";
+          unloadBtn.disabled = false;
+          unloadBtn.style.opacity = "1";
         }
       } else {
         setUnverified("");
@@ -516,6 +582,26 @@ const openSettings = async (node) => {
     }
   };
 
+  unloadBtn.onclick = async () => {
+    const model = inputs.server_model.value;
+    if (!model || model === "(auto)") {
+      statusText.style.color = "#fb923c";
+      statusText.textContent = "언로드할 모델을 목록에서 고르세요.";
+      return;
+    }
+    unloadBtn.disabled = true;
+    statusText.style.color = "#8b949e";
+    statusText.textContent = `${model} 언로드 중…`;
+    const result = await requestModelUnload({
+      backend: inputs.backend.value, base_url: inputs.base_url.value,
+      api_key: inputs.api_key.value, model, server_model: model,
+    });
+    statusText.style.color = result?.ok ? "#34d399" : "#f87171";
+    statusText.textContent = (result?.ok ? "● " : "✗ ")
+      + (result?.detail || "언로드 응답이 없습니다.");
+    unloadBtn.disabled = false;
+  };
+
   applyBackend(false);
 
   const hint = el("p", { margin: "2px 0 0", fontSize: "11px", color: "#8b949e", lineHeight: "1.5" });
@@ -529,6 +615,7 @@ const openSettings = async (node) => {
   cancel.onclick = () => back.remove();
   save.onclick = () => {
     const next = {
+      settings_version: 2,
       backend: inputs.backend.value,
       base_url: inputs.base_url.value,
       api_key: inputs.api_key.value,
@@ -538,6 +625,7 @@ const openSettings = async (node) => {
       temperature: Number(inputs.temperature.value) || 0.7,
       max_tokens: Number(inputs.max_tokens.value) || 60000,
       thinking: inputs.thinking.value,
+      prompt_profile: inputs.prompt_profile.value,
       unload_after: inputs.unload_after.value,
       // Recorded so the node face can distinguish a checked configuration from
       // one that was merely typed in and saved.

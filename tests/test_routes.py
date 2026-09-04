@@ -68,11 +68,16 @@ eq("collect: missing keys are fine", R._collect({}, "a", "b"), [])
 d = R._llm_settings({})
 eq("llm: defaults to lmstudio", d["backend"], "lmstudio")
 eq("llm: default temperature", d["temperature"], 0.7)
-eq("llm: defaults to unloading immediately", d["unload_after"], "now")
+eq("llm: defaults to unload-on-close", d["unload_after"], "close")
 eq("llm: an explicit keep is preserved",
    R._llm_settings({"llm": {"unload_after": "keep"}})["unload_after"], "keep")
-eq("llm: an invalid unload mode falls back to now",
-   R._llm_settings({"llm": {"unload_after": "later"}})["unload_after"], "now")
+eq("llm: an invalid unload mode falls back to close",
+   R._llm_settings({"llm": {"unload_after": "later"}})["unload_after"], "close")
+eq("llm: defaults to the compact prompt", d["prompt_profile"], "fast")
+eq("llm: full prompt remains selectable",
+   R._llm_settings({"llm": {"prompt_profile": "full"}})["prompt_profile"], "full")
+eq("llm: an invalid prompt profile falls back safely",
+   R._llm_settings({"llm": {"prompt_profile": "huge"}})["prompt_profile"], "fast")
 eq("llm: unknown backend falls back", R._llm_settings({"llm": {"backend": "hax"}})["backend"], "lmstudio")
 eq("llm: v1 alias still resolves", R._llm_settings({"llm": {"backend": "openai_compatible"}})["backend"], "openai_compat")
 eq("llm: temperature is clamped high", R._llm_settings({"llm": {"temperature": 99}})["temperature"], 2.0)
@@ -251,11 +256,11 @@ ok("tokens: and saves what was typed", 'max_tokens: Number(inputs.max_tokens.val
 # --- thinking switch --------------------------------------------------------
 from h3pack.llm_backends import apply_thinking  # noqa: E402
 
-eq("thinking: defaults to the model's own behaviour", R._llm_settings({})["thinking"], "auto")
+eq("thinking: defaults off for local Qwen speed", R._llm_settings({})["thinking"], "off")
 eq("thinking: off is honoured", R._llm_settings({"llm": {"thinking": "off"}})["thinking"], "off")
 eq("thinking: on is honoured", R._llm_settings({"llm": {"thinking": "on"}})["thinking"], "on")
 eq("thinking: an unknown mode falls back rather than reaching the model",
-   R._llm_settings({"llm": {"thinking": "sometimes"}})["thinking"], "auto")
+   R._llm_settings({"llm": {"thinking": "sometimes"}})["thinking"], "off")
 
 eq("thinking: auto leaves the user turn untouched", apply_thinking("장면", "auto"), "장면")
 ok("thinking: off appends the token Qwen3 reads", apply_thinking("장면", "off").endswith("/no_think"))

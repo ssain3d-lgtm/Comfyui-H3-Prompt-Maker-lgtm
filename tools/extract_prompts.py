@@ -59,6 +59,7 @@ def main(prompts_ts_path, out_override=None):
         return tokenize_and_unescape(src[open_bt + 1:close_bt])
 
     base = extract_template('You are a prompt engineer for **MiniMax H3**')
+    fast = extract_template('[H3 FAST PROFILE — ONE-SHOT OUTPUT]')
     multiseg = extract_template('*MULTI-SEGMENT DIRECTIVE (ACTIVE')
     remake = extract_template('*REMAKE MODE DIRECTIVE (ACTIVE):*')
     sh_custom = extract_template('- The source is a USER-AUTHORED')
@@ -82,6 +83,10 @@ def main(prompts_ts_path, out_override=None):
                    'Voice control', 'REQUIREMENT COVERAGE', '17k+5',
                    'App execution context']:
         assert marker in base, f"missing in base: {marker}"
+    for marker in ['«MODE»', '«DURATION»', '«CAMERA»', '«SAFETY»', '«REMAKE»', '«MULTISEG»',
+                   'subject_definitions:', 'integrated_multimodal_description:',
+                   'overall_soundscape:', 'non_diegetic_music:', '17k+5']:
+        assert marker in fast, f"missing in fast profile: {marker}"
     assert '«SEGMENTS»' in multiseg
 
     out_path = pathlib.Path(__file__).resolve().parent.parent / 'h3_prompts.py'
@@ -101,6 +106,8 @@ PREAMBLE_NSFW = {preamble_nsfw!r}
 PREAMBLE_SFW = {preamble_sfw!r}
 
 BASE_TEMPLATE = {base!r}
+
+FAST_BASE_TEMPLATE = {fast!r}
 
 MULTISEG_TEMPLATE = {multiseg!r}
 
@@ -138,7 +145,7 @@ def build_remake_directive(submode, axes, strength, source_type):
 
 
 def build_system_prompt(submode, duration_seconds, is_nsfw, camera_instruction="",
-                        custom_directives="", remake=None):
+                        custom_directives="", remake=None, prompt_profile="full"):
     """Mirror of the web app's getSystemInstruction + safeGuardedSystemInstruction for minimax_h3."""
     camera_text = "Camera Setting Request: " + camera_instruction + "\\n" if camera_instruction else ""
     remake_directive = ""
@@ -165,7 +172,8 @@ def build_system_prompt(submode, duration_seconds, is_nsfw, camera_instruction="
          + "**, followed by `length X (Y.YY s)`.")
     )
     block_rule = "one code block per segment (never all segments in one block)" if is_multi else "a single code block"
-    base = (BASE_TEMPLATE
+    template = FAST_BASE_TEMPLATE if prompt_profile == "fast" else BASE_TEMPLATE
+    base = (template
             .replace("\\u00abMODE\\u00bb", submode.upper())
             .replace("\\u00abDURATION\\u00bb", str(duration_seconds))
             .replace("\\u00abCAMERA\\u00bb", camera_text)
@@ -186,7 +194,7 @@ def nearest_grid_frames(duration_seconds):
 '''.format(
         safety_nsfw=safety_nsfw, safety_sfw=safety_sfw,
         preamble_nsfw=preamble_nsfw, preamble_sfw=preamble_sfw,
-        base=base, multiseg=multiseg, remake=remake, sh_h3=sh_h3, sh_custom=sh_custom,
+        base=base, fast=fast, multiseg=multiseg, remake=remake, sh_h3=sh_h3, sh_custom=sh_custom,
         axes=axes, strengths=strengths,
     )
     target = pathlib.Path(out_override) if out_override else out_path
