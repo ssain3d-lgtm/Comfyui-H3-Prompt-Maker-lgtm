@@ -15,13 +15,15 @@ import functools
 import json
 import mimetypes
 import pathlib
+import time
 import traceback
 
 from .h3_prompts import build_system_prompt, nearest_grid_frames
 from .llm_backends import (
-    AUTO_MODEL, BACKEND_NAMES, LLMError, PRESET_BASE_URLS, PRESET_CLI_COMMANDS,
-    THINKING_MODES, UNLOAD_MODES, call_llm, clamp_max_tokens, discover_local_models,
-    normalize_backend, probe_backend, resolve_backend, warm_up_model,
+    AUTO_MODEL, BACKEND_NAMES, LLMCancelled, LLMError, PRESET_BASE_URLS,
+    PRESET_CLI_COMMANDS, StreamCancel, THINKING_MODES, UNLOAD_MODES, call_llm,
+    clamp_max_tokens, discover_local_models, normalize_backend, probe_backend,
+    resolve_backend, stream_llm, unload_model, warm_up_model,
 )
 
 PREFIX = "/h3_prompt_maker"
@@ -34,6 +36,7 @@ APP_DIR = pathlib.Path(__file__).parent / "web" / "app"
 _ALLOWED_EXT = {".html", ".js", ".css", ".map", ".svg", ".png", ".ico", ".woff2", ".json"}
 
 MAX_BODY_BYTES = 64 * 1024 * 1024  # reference media arrives inline as data URLs
+PROMPT_PROFILES = ("fast", "full")
 
 
 def _safe_asset(rel: str):
@@ -149,10 +152,12 @@ def _llm_settings(body):
         "temperature": max(0.0, min(2.0, temperature)),
         "server_model": str(llm.get("server_model") or AUTO_MODEL),
         "max_tokens": clamp_max_tokens(llm.get("max_tokens")),
-        "thinking": (str(llm.get("thinking") or "auto")
-                     if str(llm.get("thinking") or "auto") in THINKING_MODES else "auto"),
-        "unload_after": (str(llm.get("unload_after") or "now")
-                         if str(llm.get("unload_after") or "now") in UNLOAD_MODES else "now"),
+        "thinking": (str(llm.get("thinking") or "off")
+                     if str(llm.get("thinking") or "off") in THINKING_MODES else "off"),
+        "unload_after": (str(llm.get("unload_after") or "close")
+                         if str(llm.get("unload_after") or "close") in UNLOAD_MODES else "close"),
+        "prompt_profile": (str(llm.get("prompt_profile") or "fast")
+                           if str(llm.get("prompt_profile") or "fast") in PROMPT_PROFILES else "fast"),
     }
 
 
@@ -189,6 +194,152 @@ async def _offthread(fn, *args, **kwargs):
     return await loop.run_in_executor(None, functools.partial(fn, *args, **kwargs))
 
 
+def _selected_model(cfg):
+    try:
+        _kind, _url, model, _command = resolve_backend(
+            cfg["backend"], cfg["base_url"], cfg["model"], "", cfg["server_model"])
+        return model
+    except Exception:  # noqa: BLE001 — the real generation reports the useful error
+        return ""
+
+
+#: Servers whose process *is* the model: nothing this pack sends can unload
+#: them, so a model that answered once is still there and a pre-flight ping
+#: only costs a request — on llama.cpp it can also evict the prompt cache
+#: that made the previous prefill cheap.
+_ALWAYS_RESIDENT_BACKENDS = {"llamacpp", "vllm"}
+
+
+async def _warm_for_generation(cfg):
+    """Ensure modes that can unload have a resident model and time the check/load."""
+    if cfg["unload_after"] == "keep" or cfg["backend"].endswith("_cli"):
+        return None, {"load_ms": 0.0, "load_detail": "model kept resident"}
+    if normalize_backend(cfg["backend"]) in _ALWAYS_RESIDENT_BACKENDS:
+        return None, {"load_ms": 0.0, "load_detail": "server process owns the model"}
+    model = _selected_model(cfg)
+    if not model:
+        return None, {"load_ms": 0.0, "load_detail": "automatic model selection"}
+    started = time.perf_counter()
+    warm = await _offthread(warm_up_model, cfg["backend"], cfg["base_url"],
+                            cfg["api_key"], model)
+    load_ms = round((time.perf_counter() - started) * 1000, 1)
+    return (None if warm.get("ok") else warm.get("detail")), {
+        "load_ms": load_ms,
+        "load_detail": str(warm.get("detail") or ""),
+    }
+
+
+def _accepts_stream(request):
+    headers = getattr(request, "headers", {})
+    return "application/x-ndjson" in str(headers.get("Accept", "")).lower()
+
+
+async def _stream_generation(request, cfg, system_prompt, user_text, send_images,
+                             audios, seconds):
+    """Bridge a blocking OpenAI SSE stream to browser-friendly NDJSON."""
+    from aiohttp import web
+
+    response = web.StreamResponse(status=200, headers={
+        "Content-Type": "application/x-ndjson; charset=utf-8",
+        "Cache-Control": "no-cache, no-transform",
+        "X-Content-Type-Options": "nosniff",
+    })
+    await response.prepare(request)
+    route_started = time.perf_counter()
+
+    async def write_event(event):
+        data = (json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+        await response.write(data)
+
+    control = StreamCancel()
+    future = None
+    try:
+        await write_event({"type": "status", "stage": "loading", "message": "모델 준비 중…"})
+        warm_note, load_metrics = await _warm_for_generation(cfg)
+        await write_event({
+            "type": "status", "stage": "generating", "message": "프롬프트 생성 중…",
+            "metrics": load_metrics,
+        })
+
+        loop = asyncio.get_running_loop()
+        queue = asyncio.Queue()
+
+        def put(event):
+            loop.call_soon_threadsafe(queue.put_nowait, event)
+
+        def run():
+            try:
+                text, metrics = stream_llm(
+                    cfg["backend"], cfg["base_url"], cfg["model"], cfg["api_key"],
+                    cfg["cli_command"], system_prompt, user_text,
+                    images_base64=send_images, temperature=cfg["temperature"],
+                    server_model=cfg["server_model"], max_tokens=cfg["max_tokens"],
+                    thinking=cfg["thinking"], unload_after=cfg["unload_after"],
+                    audios_base64=audios, on_delta=lambda chunk: put({"type": "delta", "text": chunk}),
+                    cancel=control,
+                )
+                put({"type": "complete", "text": text, "metrics": metrics})
+            except LLMCancelled:
+                put({"type": "cancelled"})
+            except LLMError as exc:
+                detail = str(exc)
+                if warm_note:
+                    detail += ("\n\n모델 준비도 실패했습니다: " + str(warm_note)
+                               + "\n⚙️ 모델 연결에서 '모델 로드'를 한 번 눌러보세요.")
+                put({"type": "error", "error": detail, "reason": "transient"})
+            except Exception as exc:  # noqa: BLE001
+                traceback.print_exc()
+                put({"type": "error", "error": f"{type(exc).__name__}: {exc}", "reason": "unknown"})
+
+        future = loop.run_in_executor(None, run)
+        last_progress = 0.0
+        while True:
+            try:
+                event = await asyncio.wait_for(queue.get(), timeout=0.5)
+            except asyncio.TimeoutError:
+                elapsed = (time.perf_counter() - route_started) * 1000
+                if elapsed - last_progress >= 1000:
+                    await write_event({"type": "progress", "elapsed_ms": round(elapsed, 1)})
+                    last_progress = elapsed
+                continue
+
+            kind = event.get("type")
+            if kind == "complete":
+                text = str(event.pop("text", ""))
+                if not text.strip():
+                    await write_event({"type": "error", "error": "모델이 빈 응답을 반환했습니다.",
+                                       "reason": "transient"})
+                else:
+                    metrics = dict(event.get("metrics") or {})
+                    metrics.update(load_metrics)
+                    metrics["generation_ms"] = metrics.get("total_ms")
+                    metrics["total_ms"] = round((time.perf_counter() - route_started) * 1000, 1)
+                    await write_event({
+                        "type": "final", "result": text, "fallback": False,
+                        "suggestedFrames": nearest_grid_frames(seconds), "metrics": metrics,
+                    })
+                break
+            if kind == "cancelled":
+                await write_event({"type": "cancelled"})
+                break
+            if kind == "error":
+                await write_event(event)
+                break
+            await write_event(event)
+    except (ConnectionResetError, BrokenPipeError, asyncio.CancelledError, RuntimeError):
+        # Browser AbortController or closing the overlay lands here. Closing the
+        # upstream urllib response wakes its blocking readline immediately.
+        control.cancel()
+    finally:
+        if control.is_set() and future is not None:
+            future.cancel()
+        try:
+            await response.write_eof()
+        except Exception:
+            pass
+    return response
+
+
 def register(routes):
     @routes.get(PREFIX + "/api/health")
     async def health(request):
@@ -200,6 +351,7 @@ def register(routes):
             "backends": BACKEND_NAMES,
             "thinking_modes": THINKING_MODES,
             "unload_modes": UNLOAD_MODES,
+            "prompt_profiles": PROMPT_PROFILES,
             "preset_base_urls": PRESET_BASE_URLS,
             "preset_cli_commands": PRESET_CLI_COMMANDS,
             "models": await _offthread(discover_local_models),
@@ -228,6 +380,21 @@ def register(routes):
         if cfg["backend"].endswith("_cli"):
             return _json({"ok": True, "detail": "CLI 백엔드는 미리 로드할 모델이 없습니다."})
         return _json(await _offthread(warm_up_model, cfg["backend"], cfg["base_url"],
+                                      cfg["api_key"], model))
+
+    @routes.post(PREFIX + "/api/unload-model")
+    async def unload_selected_model(request):
+        """Release the chosen local model on demand or when the overlay closes."""
+        try:
+            body = json.loads(await request.text() or "{}")
+        except ValueError:
+            body = {}
+        cfg = _llm_settings({"llm": body})
+        if cfg["backend"].endswith("_cli"):
+            return _json({"ok": True, "supported": False,
+                          "detail": "CLI 백엔드는 실행이 끝나면 프로세스도 종료됩니다."})
+        model = _selected_model(cfg)
+        return _json(await _offthread(unload_model, cfg["backend"], cfg["base_url"],
                                       cfg["api_key"], model))
 
     @routes.post(PREFIX + "/api/edit-image")
@@ -267,11 +434,13 @@ def register(routes):
                 "source_type": "custom" if body.get("remakeSourceType") == "custom" else "h3",
             }
 
+        cfg = _llm_settings(body)
         system_prompt = build_system_prompt(
             submode, seconds, is_nsfw,
             camera_instruction=camera,
             custom_directives=str(body.get("customSystemPrompt") or ""),
             remake=remake,
+            prompt_profile=cfg["prompt_profile"],
         )
 
         images = [_strip_data_url(x) for x in _collect(body, "imageBase64", "imagesBase64")]
@@ -288,27 +457,16 @@ def register(routes):
         audios = [_strip_data_url(x) for x in _collect(body, "audioBase64", "audiosBase64")]
         audios = [x for x in audios if x][:3]
         user_text = _build_user_text(body, len(images), len(sheets), len(audios))
-        cfg = _llm_settings(body)
         # A CLI backend takes stdin only, so pictures cannot travel with it.
         send_images = (images + sheets) if not cfg["backend"].endswith("_cli") else []
 
-        # If the last run was told to unload, put the selected model back before
-        # the real generation. LM Studio v0.4+ has a native load endpoint; other
-        # servers and older LM Studio builds use the one-token fallback.
-        warm_note = None
-        if cfg["unload_after"] != "keep" and not cfg["backend"].endswith("_cli"):
-            try:
-                _k, _u, warm_model, _c = resolve_backend(
-                    cfg["backend"], cfg["base_url"], cfg["model"], "", cfg["server_model"])
-            except Exception:  # noqa: BLE001 — the real call reports it better
-                warm_model = ""
-            if warm_model:
-                warm = await _offthread(warm_up_model, cfg["backend"], cfg["base_url"],
-                                        cfg["api_key"], warm_model)
-                # A failure here is not fatal: the real call may still succeed,
-                # and if it does not, its own error is the more accurate one.
-                if not warm.get("ok"):
-                    warm_note = warm.get("detail")
+        if _accepts_stream(request):
+            return await _stream_generation(
+                request, cfg, system_prompt, user_text, send_images,
+                audios if not cfg["backend"].endswith("_cli") else None, seconds)
+
+        # JSON compatibility path for old overlay bundles and direct callers.
+        warm_note, load_metrics = await _warm_for_generation(cfg)
 
         try:
             text = await _offthread(
@@ -336,7 +494,8 @@ def register(routes):
             return _json({"error": "모델이 빈 응답을 반환했습니다. 다른 모델을 쓰거나 "
                                    "컨텍스트 길이를 늘려보세요.", "reason": "transient"}, status=502)
         return _json({"result": text, "fallback": False,
-                      "suggestedFrames": nearest_grid_frames(seconds)})
+                      "suggestedFrames": nearest_grid_frames(seconds),
+                      "metrics": load_metrics})
 
     @routes.get(PREFIX + "/app")
     async def app_index(request):

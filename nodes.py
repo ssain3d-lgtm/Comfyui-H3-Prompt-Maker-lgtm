@@ -287,6 +287,8 @@ class H3PromptArchitect:
                 "video_ref_note": ("STRING", {"default": ""}),
                 "audio_ref_note": ("STRING", {"default": ""}),
                 "custom_directives": ("STRING", {"multiline": True, "default": ""}),
+                "prompt_profile": (["fast", "full"], {"default": "fast",
+                    "tooltip": "fast = 렌더 핵심 규칙만 보내 입력 처리 단축; full = 전체 H3 가이드."}),
                 "send_images_to_llm": ("BOOLEAN", {"default": True}),
                 "server_model": _server_model_widget(),
             },
@@ -307,7 +309,7 @@ class H3PromptArchitect:
                  backend, base_url, model, api_key, cli_command, temperature, seed,
                  images=None, dialogue="", voice_direction="", camera_direction="",
                  video_ref_note="", audio_ref_note="", custom_directives="",
-                 send_images_to_llm=True, server_model=AUTO_MODEL):
+                 prompt_profile="fast", send_images_to_llm=True, server_model=AUTO_MODEL):
         seconds = _duration_seconds(duration)
         is_nsfw = content_mode == "NSFW"
         is_http = not str(backend).endswith("_cli") and backend != "cli"
@@ -319,6 +321,7 @@ class H3PromptArchitect:
             submode, seconds, is_nsfw,
             camera_instruction=camera_direction.strip(),
             custom_directives=custom_directives,
+            prompt_profile=prompt_profile,
         )
         user_content = _build_user_content(
             scene_request, dialogue, voice_direction, submode, seconds,
@@ -361,6 +364,8 @@ class H3PromptRemake:
                 "dialogue": ("STRING", {"multiline": True, "default": ""}),
                 "voice_direction": ("STRING", {"default": ""}),
                 "custom_directives": ("STRING", {"multiline": True, "default": ""}),
+                "prompt_profile": (["fast", "full"], {"default": "fast",
+                    "tooltip": "fast = 렌더 핵심 규칙만 보내 입력 처리 단축; full = 전체 H3 가이드."}),
                 "send_images_to_llm": ("BOOLEAN", {"default": True}),
                 "server_model": _server_model_widget(),
             },
@@ -381,7 +386,7 @@ class H3PromptRemake:
                submode, duration, content_mode,
                backend, base_url, model, api_key, cli_command, temperature, seed,
                images=None, dialogue="", voice_direction="", custom_directives="",
-               send_images_to_llm=True, server_model=AUTO_MODEL):
+               prompt_profile="fast", send_images_to_llm=True, server_model=AUTO_MODEL):
         if not source_prompt.strip():
             raise ValueError("H3 Prompt Remake: source_prompt is empty — paste the prompt to remake.")
 
@@ -407,6 +412,7 @@ class H3PromptRemake:
             submode, seconds, is_nsfw,
             custom_directives=custom_directives,
             remake={"axes": axes, "strength": strength, "source_type": src_type},
+            prompt_profile=prompt_profile,
         )
         user_content = _build_user_content(
             direction_note, dialogue, voice_direction, submode, seconds,

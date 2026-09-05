@@ -10,6 +10,7 @@ request translation that decides what the LLM is actually asked.
 import importlib.util
 import json
 import pathlib
+import re
 import sys
 
 # server_routes uses package-relative imports, as a ComfyUI custom node must.
@@ -67,11 +68,16 @@ eq("collect: missing keys are fine", R._collect({}, "a", "b"), [])
 d = R._llm_settings({})
 eq("llm: defaults to lmstudio", d["backend"], "lmstudio")
 eq("llm: default temperature", d["temperature"], 0.7)
-eq("llm: defaults to unloading immediately", d["unload_after"], "now")
+eq("llm: defaults to unload-on-close", d["unload_after"], "close")
 eq("llm: an explicit keep is preserved",
    R._llm_settings({"llm": {"unload_after": "keep"}})["unload_after"], "keep")
-eq("llm: an invalid unload mode falls back to now",
-   R._llm_settings({"llm": {"unload_after": "later"}})["unload_after"], "now")
+eq("llm: an invalid unload mode falls back to close",
+   R._llm_settings({"llm": {"unload_after": "later"}})["unload_after"], "close")
+eq("llm: defaults to the compact prompt", d["prompt_profile"], "fast")
+eq("llm: full prompt remains selectable",
+   R._llm_settings({"llm": {"prompt_profile": "full"}})["prompt_profile"], "full")
+eq("llm: an invalid prompt profile falls back safely",
+   R._llm_settings({"llm": {"prompt_profile": "huge"}})["prompt_profile"], "fast")
 eq("llm: unknown backend falls back", R._llm_settings({"llm": {"backend": "hax"}})["backend"], "lmstudio")
 eq("llm: v1 alias still resolves", R._llm_settings({"llm": {"backend": "openai_compatible"}})["backend"], "openai_compat")
 eq("llm: temperature is clamped high", R._llm_settings({"llm": {"temperature": 99}})["temperature"], 2.0)
@@ -250,11 +256,11 @@ ok("tokens: and saves what was typed", 'max_tokens: Number(inputs.max_tokens.val
 # --- thinking switch --------------------------------------------------------
 from h3pack.llm_backends import apply_thinking  # noqa: E402
 
-eq("thinking: defaults to the model's own behaviour", R._llm_settings({})["thinking"], "auto")
+eq("thinking: defaults off for local Qwen speed", R._llm_settings({})["thinking"], "off")
 eq("thinking: off is honoured", R._llm_settings({"llm": {"thinking": "off"}})["thinking"], "off")
 eq("thinking: on is honoured", R._llm_settings({"llm": {"thinking": "on"}})["thinking"], "on")
 eq("thinking: an unknown mode falls back rather than reaching the model",
-   R._llm_settings({"llm": {"thinking": "sometimes"}})["thinking"], "auto")
+   R._llm_settings({"llm": {"thinking": "sometimes"}})["thinking"], "off")
 
 eq("thinking: auto leaves the user turn untouched", apply_thinking("장면", "auto"), "장면")
 ok("thinking: off appends the token Qwen3 reads", apply_thinking("장면", "off").endswith("/no_think"))
@@ -267,6 +273,23 @@ _js = (_PACK / "web" / "h3_maker.js").read_text(encoding="utf-8")
 ok("thinking: the dialog offers the three modes",
    'inputs.thinking' in _js and '"off"' in _js and '"on"' in _js)
 ok("thinking: and saves the choice", 'thinking: inputs.thinking.value' in _js)
+
+# --- one repository name, everywhere ----------------------------------------
+# The repo was reachable under two spellings for a while (GitHub redirects a
+# renamed repo), so the README, pyproject and the web app's prompts.ts drifted
+# apart. A redirect is not forever: it breaks the day someone registers the old
+# name. The clone URL in the README is also the folder name a user ends up with
+# under custom_nodes, so it is the one that has to be right.
+REPO_NAME = "Comfyui-H3-Prompt-Maker-lgtm"
+for _rel in ("README.md", "pyproject.toml"):
+    _text = (_PACK / _rel).read_text(encoding="utf-8")
+    _urls = re.findall(r"github\.com/ssain3d-lgtm/([A-Za-z0-9._-]+?)(?:\.git)?(?=[\s\)\"'<]|$)", _text)
+    # Only the URLs that point at THIS pack — the README also links the web app
+    # repo the overlay and prompts are extracted from, which is a different one.
+    _mine = {u for u in _urls if "lgtm" in u.lower() and "h3-prompt-maker" in u.lower()}
+    ok(f"repo: {_rel} links this pack at all", bool(_mine), f"found {_urls}")
+    for _name in _mine:
+        eq(f"repo: {_rel} spells it {REPO_NAME}", _name, REPO_NAME)
 
 # --- constants the frontend relies on ---------------------------------------
 eq("prefix matches the app's API_BASE", R.PREFIX + "/api", "/h3_prompt_maker/api")

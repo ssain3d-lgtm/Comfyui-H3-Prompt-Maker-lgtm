@@ -262,8 +262,8 @@ try:
 
     call("off")
     b = sent[0]["payload"]
-    ok("off maps to reasoning_effort none",
-       b.get("reasoning_effort") == "none", b.get("reasoning_effort"))
+    ok("off maps to reasoning_effort low (3.x models reject none)",
+       b.get("reasoning_effort") == "low", b.get("reasoning_effort"))
     ok("off never appends /no_think for Gemini",
        not b["messages"][1]["content"].endswith("/no_think"), b["messages"][1]["content"])
     ok("off sends no Qwen template switch", "chat_template_kwargs" not in b)
@@ -272,8 +272,8 @@ try:
     ok("on maps to reasoning_effort high",
        sent[0]["payload"].get("reasoning_effort") == "high")
 
-    # Gemini 3 models cannot switch thinking off and reject the field with a 400.
-    call("off", steps=("Gemini API returned HTTP 400: reasoning_effort none is not supported",))
+    # A model that does not take the field at all rejects it with a 400.
+    call("off", steps=("Gemini API returned HTTP 400: reasoning_effort is not supported",))
     ok("rejected reasoning_effort is shed and retried",
        len(sent) == 2 and "reasoning_effort" not in sent[1]["payload"], len(sent))
 

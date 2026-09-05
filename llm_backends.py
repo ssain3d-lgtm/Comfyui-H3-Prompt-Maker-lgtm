@@ -20,26 +20,73 @@ import re
 import shlex
 import subprocess
 import sys
+import threading
 import time
 import urllib.parse
 import urllib.request
 import urllib.error
-import urllib.parse
 
 
 class LLMError(RuntimeError):
     pass
 
 
-def _post_json(url, payload, api_key, timeout):
+class LLMCancelled(LLMError):
+    """The caller stopped an in-flight streamed completion."""
+
+
+class StreamCancel:
+    """Cross-thread cancellation that also closes a blocking urllib response.
+
+    ``threading.Event`` alone is only observed after the next SSE line arrives.
+    During a long model load/prefill that can take minutes, so the aiohttp route
+    attaches the active response here and can close its socket immediately when
+    the browser aborts the fetch.
+    """
+
+    def __init__(self):
+        self._event = threading.Event()
+        self._lock = threading.Lock()
+        self._response = None
+
+    def is_set(self):
+        return self._event.is_set()
+
+    def attach(self, response):
+        with self._lock:
+            if self._event.is_set():
+                try:
+                    response.close()
+                finally:
+                    raise LLMCancelled("Generation cancelled.")
+            self._response = response
+
+    def detach(self, response):
+        with self._lock:
+            if self._response is response:
+                self._response = None
+
+    def cancel(self):
+        self._event.set()
+        with self._lock:
+            response = self._response
+            self._response = None
+        if response is not None:
+            try:
+                response.close()
+            except Exception:
+                pass
+
+
+def _open_json_response(url, payload, api_key, timeout):
+    """Open a JSON POST and preserve the existing safe error reporting rules."""
     headers = {"Content-Type": "application/json"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"),
                                  headers=headers, method="POST")
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as res:
-            return json.loads(res.read().decode("utf-8", errors="replace"))
+        return urllib.request.urlopen(req, timeout=timeout)
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")[:2000]
         # The reply body is the fastest way to see why a server said no, so it
@@ -63,6 +110,11 @@ def _post_json(url, payload, api_key, timeout):
         raise LLMError(f"Cannot reach LLM server at {url}: {e.reason}") from e
 
 
+def _post_json(url, payload, api_key, timeout):
+    with _open_json_response(url, payload, api_key, timeout) as res:
+        return json.loads(res.read().decode("utf-8", errors="replace"))
+
+
 #: A reasoning model spends this budget thinking before it answers. At 8192 a
 #: Qwen3-class model could burn nearly all of it inside <think> and emit a
 #: single line of assumptions as the "answer" — which is exactly what happened.
@@ -83,9 +135,10 @@ def clamp_max_tokens(value, default=DEFAULT_MAX_TOKENS):
 
 #: What happens to the model after a generation finishes.
 #: "keep"  stay resident — fastest next run, holds the VRAM
+#: "close" stay resident while the overlay is open, then explicitly unload
 #: "5m"    stay for five idle minutes, then unload
 #: "now"   unload as soon as the answer is returned
-UNLOAD_MODES = ["keep", "5m", "now"]
+UNLOAD_MODES = ["keep", "close", "5m", "now"]
 
 #: Idle seconds per mode. LM Studio uses ttl for JIT-loaded models and its native
 #: v1 endpoint for a guaranteed immediate unload; Ollama uses keep_alive on the
@@ -119,6 +172,7 @@ def unload_payload(mode, backend="openai_compat"):
 #: "off"   suppress it: the whole budget goes to the answer
 #: "on"    force it on
 THINKING_MODES = ["auto", "off", "on"]
+DEFAULT_THINKING = "off"
 
 #: Qwen3 and its derivatives read these as commands from the user turn. They are
 #: plain text, so a model that does not know them simply ignores them — which is
@@ -191,30 +245,23 @@ def audio_format(b64):
     return "wav"
 
 
-def call_openai_compatible(base_url, model, api_key, system_prompt, user_text,
-                           images_base64=None, temperature=0.7, seed=-1, timeout=600,
-                           max_tokens=DEFAULT_MAX_TOKENS, thinking="auto", unload_after="keep",
-                           audios_base64=None, backend_name="openai_compat"):
-    url = base_url.rstrip("/") + "/chat/completions"
+def _chat_payload(base_url, model, system_prompt, user_text, images_base64,
+                  audios_base64, temperature, seed, max_tokens, thinking,
+                  unload_after, backend_name, stream=False):
+    """Build one OpenAI-compatible request and return its controlled user text."""
     gemini = is_gemini_target(base_url)
-    if not gemini:
-        # /no_think is a Qwen convention; on Gemini it would just land in the
-        # prompt as literal text. Gemini gets reasoning_effort below instead.
-        user_text = apply_thinking(user_text, thinking)
+    controlled_text = user_text if gemini else apply_thinking(user_text, thinking)
 
     if images_base64 or audios_base64:
-        content = [{"type": "text", "text": user_text}]
+        content = [{"type": "text", "text": controlled_text}]
         for b64 in (images_base64 or []):
             content.append({"type": "image_url",
                             "image_url": {"url": f"data:{image_mime(b64)};base64,{b64}"}})
-        # Only an omni model (Qwen2-Audio, Qwen2.5/3-Omni, gpt-4o-audio) has an
-        # audio tower. A text or vision-only model rejects this, and the retry
-        # below drops it — which is the honest outcome, not a silent success.
         for b64 in (audios_base64 or []):
             content.append({"type": "input_audio",
                             "input_audio": {"data": b64, "format": audio_format(b64)}})
     else:
-        content = user_text
+        content = controlled_text
 
     payload = {
         "model": model or "local-model",
@@ -230,17 +277,68 @@ def call_openai_compatible(base_url, model, api_key, system_prompt, user_text,
     payload.update(unload_payload(unload_after, backend_name))
     if thinking in ("off", "on"):
         if gemini:
-            # Google's compatibility layer speaks reasoning_effort. "none"
-            # disables thinking where the model allows it (flash); a model that
-            # cannot (2.5-pro) rejects it with a 400 and the retry below sheds
-            # the field, which lands on the model's own default — same contract
-            # as chat_template_kwargs on servers that do not know it.
-            payload["reasoning_effort"] = "none" if thinking == "off" else "high"
+            # Google's compatibility layer speaks reasoning_effort. Current
+            # (3.x) models cannot switch thinking off at all and answer
+            # "none" with a 400, which cost every generation a retry now that
+            # off is the default; "low" is the least thinking every model
+            # accepts, "high" the most. A model that still rejects the field
+            # is retried without it by _retry_chat_payload.
+            payload["reasoning_effort"] = "low" if thinking == "off" else "high"
         else:
-            # vLLM and recent LM Studio builds switch Qwen3's chat template with
-            # this. It is the reliable half of the switch where it is supported;
-            # the /no_think token already in user_text covers everywhere else.
             payload["chat_template_kwargs"] = {"enable_thinking": thinking == "on"}
+    if stream:
+        payload["stream"] = True
+        # LM Studio and current OpenAI-compatible servers return exact token
+        # counts in the final chunk when asked. Older servers reject this field;
+        # the normal optional-capability retry below removes it automatically.
+        payload["stream_options"] = {"include_usage": True}
+    return payload, controlled_text, gemini
+
+
+def _retry_chat_payload(payload, message, gemini, controlled_text):
+    """Remove one unsupported capability and say whether the request can retry."""
+    msg = message.lower()
+    if gemini and "max_tokens" in payload and (
+            "max_tokens" in msg or "max_output_tokens" in msg or "output token" in msg):
+        # The 60000 default is headroom for local reasoning models, but it
+        # sits above some Gemini models' output cap and Google rejects it by
+        # its own field name (max_output_tokens). Dropping the field falls
+        # back to that model's maximum — which is what the headroom meant.
+        del payload["max_tokens"]
+        return True
+
+    optional = [k for k in ("stream_options", "chat_template_kwargs", "ttl", "keep_alive",
+                            "reasoning_effort") if k in payload]
+    optional_rejected = ("400" in msg or "template" in msg or "extra" in msg
+                         or "unrecognized" in msg or "unknown" in msg)
+    if optional and optional_rejected:
+        for key in optional:
+            payload.pop(key, None)
+        return True
+
+    content_now = payload["messages"][1]["content"]
+    parts = content_now if isinstance(content_now, list) else []
+    media_rejected = ("image" in msg or "vision" in msg or "audio" in msg
+                      or "content" in msg or "400" in msg)
+    if media_rejected and any(p.get("type") == "input_audio" for p in parts):
+        payload["messages"][1]["content"] = [
+            part for part in parts if part.get("type") != "input_audio"
+        ]
+        return True
+    if media_rejected and any(p.get("type") == "image_url" for p in parts):
+        payload["messages"][1]["content"] = controlled_text
+        return True
+    return False
+
+
+def call_openai_compatible(base_url, model, api_key, system_prompt, user_text,
+                           images_base64=None, temperature=0.7, seed=-1, timeout=600,
+                           max_tokens=DEFAULT_MAX_TOKENS, thinking=DEFAULT_THINKING, unload_after="keep",
+                           audios_base64=None, backend_name="openai_compat"):
+    url = base_url.rstrip("/") + "/chat/completions"
+    payload, controlled_text, gemini = _chat_payload(
+        base_url, model, system_prompt, user_text, images_base64, audios_base64,
+        temperature, seed, max_tokens, thinking, unload_after, backend_name)
 
     def post():
         return _post_json(url, payload, api_key, timeout)
@@ -255,35 +353,7 @@ def call_openai_compatible(base_url, model, api_key, system_prompt, user_text,
             answer = _extract_text(post())
             break
         except LLMError as exc:
-            msg = str(exc).lower()
-            if gemini and "max_tokens" in payload and (
-                    "max_tokens" in msg or "max_output_tokens" in msg or "output token" in msg):
-                # The 60000 default is headroom for local reasoning models, but
-                # it sits above some Gemini models' output cap and Google
-                # rejects it by name. Dropping the field falls back to that
-                # model's own maximum — which is what the headroom meant.
-                del payload["max_tokens"]
-                continue
-            optional = [k for k in ("chat_template_kwargs", "ttl", "keep_alive",
-                                    "reasoning_effort") if k in payload]
-            optional_rejected = ("400" in msg or "template" in msg or "extra" in msg
-                                 or "unrecognized" in msg or "unknown" in msg)
-            if optional and optional_rejected:
-                for key in optional:
-                    payload.pop(key, None)
-                continue
-
-            content_now = payload["messages"][1]["content"]
-            parts = content_now if isinstance(content_now, list) else []
-            media_rejected = ("image" in msg or "vision" in msg or "audio" in msg
-                              or "content" in msg or "400" in msg)
-            if media_rejected and any(p.get("type") == "input_audio" for p in parts):
-                payload["messages"][1]["content"] = [
-                    part for part in parts if part.get("type") != "input_audio"
-                ]
-                continue
-            if media_rejected and any(p.get("type") == "image_url" for p in parts):
-                payload["messages"][1]["content"] = user_text
+            if _retry_chat_payload(payload, str(exc), gemini, controlled_text):
                 continue
             raise
 
@@ -296,6 +366,203 @@ def call_openai_compatible(base_url, model, api_key, system_prompt, user_text,
         if not result["ok"]:
             print(f"H3 Prompt Maker: LM Studio unload warning: {result['detail']}", file=sys.stderr)
     return answer
+
+
+def _metric_number(mapping, *names):
+    for name in names:
+        value = mapping.get(name) if isinstance(mapping, dict) else None
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return value
+    return None
+
+
+def _stream_metrics(started, first_token_at, usage, stats, answer):
+    """Normalize OpenAI/LM Studio counters into the fields the overlay shows."""
+    ended = time.perf_counter()
+    total_ms = max(0.0, (ended - started) * 1000)
+    ttft_ms = ((first_token_at - started) * 1000) if first_token_at else None
+    prompt_tokens = _metric_number(usage, "prompt_tokens", "input_tokens")
+    completion_tokens = _metric_number(usage, "completion_tokens", "output_tokens")
+    if completion_tokens is None:
+        completion_tokens = _metric_number(stats, "predicted_tokens", "completion_tokens", "output_tokens")
+    if prompt_tokens is None:
+        prompt_tokens = _metric_number(stats, "prompt_tokens", "input_tokens")
+    reported_tps = _metric_number(stats, "tokens_per_second", "generation_tokens_per_second",
+                                  "predicted_tokens_per_second")
+    decode_ms = total_ms - (ttft_ms or 0.0)
+    calculated_tps = ((float(completion_tokens) / (decode_ms / 1000))
+                      if completion_tokens is not None and decode_ms > 0 else None)
+    details = usage.get("completion_tokens_details") if isinstance(usage, dict) else None
+    prompt_details = usage.get("prompt_tokens_details") if isinstance(usage, dict) else None
+    return {
+        "ttft_ms": round(ttft_ms, 1) if ttft_ms is not None else None,
+        "total_ms": round(total_ms, 1),
+        "prompt_tokens": int(prompt_tokens) if prompt_tokens is not None else None,
+        "completion_tokens": int(completion_tokens) if completion_tokens is not None else None,
+        "reasoning_tokens": (int(_metric_number(details, "reasoning_tokens"))
+                             if _metric_number(details, "reasoning_tokens") is not None else None),
+        "cached_tokens": (int(_metric_number(prompt_details, "cached_tokens"))
+                          if _metric_number(prompt_details, "cached_tokens") is not None else None),
+        "tokens_per_second": round(float(reported_tps or calculated_tps), 2)
+        if (reported_tps or calculated_tps) is not None else None,
+        "output_chars": len(answer),
+        "streamed": True,
+    }
+
+
+def _read_openai_stream(response, on_delta, cancel, started):
+    content_chunks, reasoning_chunks, raw_chunks = [], [], []
+    usage, stats = {}, {}
+    first_token_at = None
+    saw_sse = False
+    try:
+        for raw_line in response:
+            if cancel is not None and cancel.is_set():
+                raise LLMCancelled("Generation cancelled.")
+            line = raw_line.decode("utf-8", errors="replace").strip()
+            if not line:
+                continue
+            if not line.startswith("data:"):
+                raw_chunks.append(raw_line)
+                continue
+            saw_sse = True
+            data_text = line[5:].strip()
+            if data_text == "[DONE]":
+                break
+            try:
+                data = json.loads(data_text)
+            except ValueError:
+                continue
+            if isinstance(data.get("usage"), dict):
+                usage.update(data["usage"])
+            if isinstance(data.get("stats"), dict):
+                stats.update(data["stats"])
+            choices = data.get("choices")
+            if not isinstance(choices, list) or not choices:
+                continue
+            choice = choices[0] if isinstance(choices[0], dict) else {}
+            delta = choice.get("delta") if isinstance(choice.get("delta"), dict) else {}
+            # A few compatible servers send a complete message in the last
+            # chunk rather than deltas. Treat it as one final delta.
+            if not delta and isinstance(choice.get("message"), dict):
+                delta = choice["message"]
+            reasoning = delta.get("reasoning_content") or delta.get("reasoning")
+            content = delta.get("content")
+            if isinstance(reasoning, str) and reasoning:
+                reasoning_chunks.append(reasoning)
+                first_token_at = first_token_at or time.perf_counter()
+            if isinstance(content, str) and content:
+                content_chunks.append(content)
+                first_token_at = first_token_at or time.perf_counter()
+                if on_delta:
+                    on_delta(content)
+    except LLMCancelled:
+        raise
+    except Exception as exc:
+        if cancel is not None and cancel.is_set():
+            raise LLMCancelled("Generation cancelled.") from exc
+        raise LLMError(f"Streaming response failed: {exc}") from exc
+
+    if cancel is not None and cancel.is_set():
+        raise LLMCancelled("Generation cancelled.")
+
+    if not saw_sse:
+        try:
+            data = json.loads(b"".join(raw_chunks).decode("utf-8", errors="replace"))
+        except Exception as exc:
+            raise LLMError(f"Unexpected streaming response: {exc}") from exc
+        answer = _extract_text(data)
+        if on_delta:
+            on_delta(answer)
+        usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+        stats = data.get("stats") if isinstance(data.get("stats"), dict) else {}
+        first_token_at = first_token_at or time.perf_counter()
+    else:
+        content = "".join(content_chunks)
+        reasoning = "".join(reasoning_chunks)
+        answer = (f"<think>{reasoning}</think>\n{content}" if reasoning else content)
+        if not answer.strip():
+            raise LLMError("LLM returned an empty streaming response.")
+
+    return answer, _stream_metrics(started, first_token_at, usage, stats, answer)
+
+
+def call_openai_compatible_stream(base_url, model, api_key, system_prompt, user_text,
+                                  images_base64=None, temperature=0.7, seed=-1, timeout=600,
+                                  max_tokens=DEFAULT_MAX_TOKENS, thinking=DEFAULT_THINKING,
+                                  unload_after="keep", audios_base64=None,
+                                  backend_name="openai_compat", on_delta=None, cancel=None):
+    """Stream one completion, returning ``(text, metrics)`` with real cancellation."""
+    url = base_url.rstrip("/") + "/chat/completions"
+    payload, controlled_text, gemini = _chat_payload(
+        base_url, model, system_prompt, user_text, images_base64, audios_base64,
+        temperature, seed, max_tokens, thinking, unload_after, backend_name, stream=True)
+    started = time.perf_counter()
+
+    while True:
+        if cancel is not None and cancel.is_set():
+            raise LLMCancelled("Generation cancelled.")
+        response = None
+        try:
+            response = _open_json_response(url, payload, api_key, timeout)
+            if cancel is not None:
+                cancel.attach(response)
+            answer, metrics = _read_openai_stream(response, on_delta, cancel, started)
+            break
+        except LLMCancelled:
+            raise
+        except LLMError as exc:
+            msg = str(exc).lower()
+            # Preserve media when an older server rejects streaming. A generic
+            # HTTP 400 is also used for unsupported image parts, so letting the
+            # media fallback run first would silently turn a VLM request into a
+            # text-only retry merely because `stream` was the unknown field.
+            if "stream_options" in payload and ("stream_options" in msg or "stream options" in msg):
+                payload.pop("stream_options", None)
+                continue
+            # Very old compatibility servers can reject streaming itself. Keep
+            # generation working, but mark it non-streamed and deliver at once.
+            if ("stream" in payload and "stream" in msg
+                    and ("400" in msg or "unknown" in msg or "unsupported" in msg)):
+                payload.pop("stream", None)
+                payload.pop("stream_options", None)
+                fallback_started = time.perf_counter()
+                try:
+                    response = _open_json_response(url, payload, api_key, timeout)
+                    if cancel is not None:
+                        cancel.attach(response)
+                    data = json.loads(response.read().decode("utf-8", errors="replace"))
+                except Exception as fallback_exc:
+                    if cancel is not None and cancel.is_set():
+                        raise LLMCancelled("Generation cancelled.") from fallback_exc
+                    raise
+                answer = _extract_text(data)
+                if on_delta:
+                    on_delta(answer)
+                elapsed = (time.perf_counter() - fallback_started) * 1000
+                metrics = {"ttft_ms": round(elapsed, 1), "total_ms": round(elapsed, 1),
+                           "prompt_tokens": None, "completion_tokens": None,
+                           "reasoning_tokens": None, "cached_tokens": None,
+                           "tokens_per_second": None, "output_chars": len(answer),
+                           "streamed": False}
+                break
+            if _retry_chat_payload(payload, str(exc), gemini, controlled_text):
+                continue
+            raise
+        finally:
+            if response is not None:
+                if cancel is not None:
+                    cancel.detach(response)
+                try:
+                    response.close()
+                except Exception:
+                    pass
+
+    if normalize_backend(backend_name) == "lmstudio" and unload_after == "now":
+        result = _unload_lmstudio_model(base_url, api_key, model, min(timeout, 15.0))
+        if not result["ok"]:
+            print(f"H3 Prompt Maker: LM Studio unload warning: {result['detail']}", file=sys.stderr)
+    return answer, metrics
 
 
 def call_cli(cli_command, system_prompt, user_text, timeout=600):
@@ -852,7 +1119,7 @@ def resolve_api_key(api_key, target_url=None):
 
 def call_llm(backend, base_url, model, api_key, cli_command, system_prompt,
              user_text, images_base64=None, temperature=0.7, seed=-1, timeout=600,
-             server_model=AUTO_MODEL, max_tokens=DEFAULT_MAX_TOKENS, thinking="auto",
+             server_model=AUTO_MODEL, max_tokens=DEFAULT_MAX_TOKENS, thinking=DEFAULT_THINKING,
              unload_after="keep", audios_base64=None):
     backend = normalize_backend(backend)
     kind, url, mdl, cmd = resolve_backend(backend, base_url, model, cli_command, server_model)
@@ -868,6 +1135,73 @@ def call_llm(backend, base_url, model, api_key, cli_command, system_prompt,
                                    seed=seed, timeout=timeout, max_tokens=max_tokens,
                                    thinking=thinking, unload_after=unload_after,
                                    audios_base64=audios_base64, backend_name=backend)
+
+
+def stream_llm(backend, base_url, model, api_key, cli_command, system_prompt,
+               user_text, images_base64=None, temperature=0.7, seed=-1, timeout=600,
+               server_model=AUTO_MODEL, max_tokens=DEFAULT_MAX_TOKENS,
+               thinking=DEFAULT_THINKING, unload_after="keep", audios_base64=None,
+               on_delta=None, cancel=None):
+    """Streaming counterpart of :func:`call_llm` used by the overlay route."""
+    backend = normalize_backend(backend)
+    kind, url, mdl, cmd = resolve_backend(backend, base_url, model, cli_command, server_model)
+    if kind == "cli":
+        if cancel is not None and cancel.is_set():
+            raise LLMCancelled("Generation cancelled.")
+        started = time.perf_counter()
+        answer = call_cli(cmd, system_prompt, apply_thinking(user_text, thinking), timeout=timeout)
+        if cancel is not None and cancel.is_set():
+            raise LLMCancelled("Generation cancelled.")
+        if on_delta:
+            on_delta(answer)
+        elapsed = (time.perf_counter() - started) * 1000
+        return answer, {
+            "ttft_ms": round(elapsed, 1), "total_ms": round(elapsed, 1),
+            "prompt_tokens": None, "completion_tokens": None,
+            "reasoning_tokens": None, "cached_tokens": None,
+            "tokens_per_second": None, "output_chars": len(answer),
+            "streamed": False,
+        }
+    key = resolve_api_key(api_key, url)
+    if is_gemini_target(url) and not mdl:
+        mdl = default_gemini_model(key, timeout=min(timeout, 8.0))
+        print(f"[h3_prompt_maker] gemini (auto) → {mdl}", flush=True)
+    return call_openai_compatible_stream(
+        url, mdl, key, system_prompt, user_text,
+        images_base64=images_base64, temperature=temperature, seed=seed,
+        timeout=timeout, max_tokens=max_tokens, thinking=thinking,
+        unload_after=unload_after, audios_base64=audios_base64,
+        backend_name=backend, on_delta=on_delta, cancel=cancel)
+
+
+def unload_model(backend, base_url, api_key, model, timeout=20.0):
+    """Explicitly release a selected model for the overlay's close/manual action."""
+    if not model:
+        return {"ok": False, "supported": True, "detail": "언로드할 모델을 먼저 선택하세요."}
+    try:
+        _kind, url, _m, _c = resolve_backend(backend, base_url, model, "")
+    except LLMError as exc:
+        return {"ok": False, "supported": True, "detail": str(exc)}
+    if is_gemini_target(url):
+        return {"ok": True, "supported": False, "detail": "클라우드 모델은 로컬 VRAM을 사용하지 않습니다."}
+    key = resolve_api_key(api_key, url)
+    normalized = normalize_backend(backend)
+    if normalized == "lmstudio":
+        return _unload_lmstudio_model(url, key, model, timeout)
+    if normalized == "ollama":
+        parts = urllib.parse.urlsplit(url)
+        path = parts.path.rstrip("/")
+        if path.endswith("/v1"):
+            path = path[:-3]
+        endpoint = urllib.parse.urlunsplit(
+            (parts.scheme, parts.netloc, path + "/api/generate", "", ""))
+        try:
+            _post_json(endpoint, {"model": model, "keep_alive": 0, "stream": False}, key, timeout)
+            return {"ok": True, "supported": True, "detail": f"{model} 언로드됨"}
+        except Exception as exc:
+            return {"ok": False, "supported": True, "detail": f"Ollama 언로드 실패: {exc}"}
+    return {"ok": False, "supported": False,
+            "detail": "이 백엔드는 실행 중인 서버 프로세스가 모델을 소유하므로 여기서 언로드할 수 없습니다."}
 
 
 def probe_backend(backend, base_url, api_key, cli_command, timeout=6.0):
