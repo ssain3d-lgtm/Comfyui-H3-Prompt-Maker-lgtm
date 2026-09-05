@@ -3,12 +3,18 @@
 
 The gemini preset must reach Google's pinned host with Google's own key and
 the right request shape — and never let the generic OpenAI key, the Qwen
-/no_think token, or a VRAM warm-up call leak into a Google request."""
+/no_think token, or a VRAM warm-up call leak into a Google request.
+
+(auto) must come from Google's live list, never from a name fixed in the
+code: the hard-coded gemini-2.5-flash default turned into a 404 for every
+user the day Google retired it (2026-06-17)."""
 import importlib.util
+import io
 import json
 import os
 import pathlib
 import sys
+import urllib.error
 
 P = pathlib.Path(__file__).resolve().parent.parent
 sp = importlib.util.spec_from_file_location(
@@ -30,6 +36,10 @@ def ok(n, c, d=""):
         fails.append(f"{n}{chr(10) + '      ' + str(d) if d else ''}")
 
 
+def reset_default_cache():
+    L._GEMINI_DEFAULT_CACHE.update({"at": 0.0, "key": "", "id": ""})
+
+
 # --- wiring -----------------------------------------------------------------
 ok("gemini is a selectable backend", "gemini" in L.BACKEND_NAMES)
 ok("preset address is Google's OpenAI-compatible endpoint",
@@ -39,24 +49,152 @@ ok("local discovery never probes the cloud",
 ok("gemini gets no ttl/keep_alive dialect", L.unload_payload("now", "gemini") == {})
 
 kind, url, mdl, _cmd = L.resolve_backend("gemini", "", "", "")
-ok("empty model falls back to the default",
-   (kind, url, mdl) == ("http", L.GEMINI_BASE_URL, L.DEFAULT_GEMINI_MODEL), (kind, url, mdl))
-_k, _u, mdl, _c = L.resolve_backend("gemini", "", "models/gemini-2.5-pro", "")
-ok("models/ prefix from Google's list is stripped", mdl == "gemini-2.5-pro", mdl)
-_k, _u, mdl, _c = L.resolve_backend("gemini", "", "typed-model", "", server_model="gemini-3-flash")
-ok("server_model dropdown wins over the typed field", mdl == "gemini-3-flash", mdl)
+ok("empty model stays empty here — (auto) is resolved against the live list later",
+   (kind, url, mdl) == ("http", L.GEMINI_BASE_URL, ""), (kind, url, mdl))
+_k, _u, mdl, _c = L.resolve_backend("gemini", "", "models/gemini-3.6-flash", "")
+ok("models/ prefix from Google's list is stripped", mdl == "gemini-3.6-flash", mdl)
+_k, _u, mdl, _c = L.resolve_backend("gemini", "", "typed-model", "", server_model="gemini-3.8-flash")
+ok("server_model dropdown wins over the typed field", mdl == "gemini-3.8-flash", mdl)
 
 # --- model list filtering ----------------------------------------------------
-listing = ["models/gemini-2.5-flash", "models/gemini-2.5-pro",
+listing = ["models/gemini-3.6-flash", "models/gemini-3.1-pro",
            "models/gemini-embedding-001", "models/text-embedding-004",
-           "models/imagen-3.0-generate-002", "models/gemini-2.5-flash-image",
-           "models/veo-2.0-generate-001", "models/gemini-2.5-flash-preview-tts",
-           "models/gemini-2.0-flash-live-001", "models/aqa",
-           "models/gemma-3-27b-it", "models/gemini-2.5-flash"]
+           "models/imagen-3.0-generate-002", "models/gemini-3.6-flash-image",
+           "models/veo-2.0-generate-001", "models/gemini-3.6-flash-preview-tts",
+           "models/gemini-3.6-flash-live-001", "models/aqa",
+           "models/gemma-3-27b-it", "models/gemini-3.6-flash"]
 ok("only chat-capable ids survive, bare and deduped",
    L.filter_gemini_chat_models(listing) ==
-   ["gemini-2.5-flash", "gemini-2.5-pro", "gemma-3-27b-it"],
+   ["gemini-3.6-flash", "gemini-3.1-pro", "gemma-3-27b-it"],
    L.filter_gemini_chat_models(listing))
+
+# --- (auto) picks the newest stable Flash from whatever Google lists --------
+ok("newest stable flash wins over older stable, previews, lite and pro",
+   L.pick_default_gemini_model([
+       "gemini-2.5-flash", "gemini-3.6-flash", "gemini-3.8-flash-preview",
+       "gemini-3.6-flash-lite", "gemini-3.1-pro", "gemini-3-flash-preview"]) == "gemini-3.6-flash")
+ok("version compare is numeric, not lexical (3.10 > 3.6)",
+   L.pick_default_gemini_model(["gemini-3.6-flash", "gemini-3.10-flash"]) == "gemini-3.10-flash")
+ok("a preview is chosen only when no stable flash exists",
+   L.pick_default_gemini_model(["gemini-3-flash-preview", "gemini-3.8-flash-preview-05-20",
+                                "gemini-3.1-pro"]) == "gemini-3.8-flash-preview-05-20")
+ok("no flash at all -> the fallback constant",
+   L.pick_default_gemini_model(["gemini-3.1-pro", "gemma-3-27b-it"]) == L.DEFAULT_GEMINI_MODEL)
+ok("a preview with a product suffix is a different product, never (auto)",
+   L.pick_default_gemini_model(["gemini-2.0-flash-preview-image-generation"]) == L.DEFAULT_GEMINI_MODEL)
+ok("empty list -> the fallback constant",
+   L.pick_default_gemini_model([]) == L.DEFAULT_GEMINI_MODEL)
+
+# --- native list: capability flags + paging, with the OpenAI list as fallback
+native_pages = {
+    "": {"models": [
+        {"name": "models/gemini-3.6-flash", "supportedGenerationMethods": ["generateContent", "countTokens"]},
+        {"name": "models/text-embedding-004", "supportedGenerationMethods": ["embedContent"]},
+        {"name": "models/gemini-3.6-flash-image", "supportedGenerationMethods": ["generateContent"]},
+    ], "nextPageToken": "p2"},
+    "p2": {"models": [
+        {"name": "models/gemini-3.8-flash-preview", "supportedGenerationMethods": ["generateContent"]},
+        {"name": "models/veo-3.0", "supportedGenerationMethods": ["predictLongRunning"]},
+    ]},
+}
+seen_urls = []
+
+
+class _Resp(io.BytesIO):
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def fake_urlopen(req, timeout=None):
+    url = req.full_url if hasattr(req, "full_url") else str(req)
+    seen_urls.append(url)
+    if url.startswith(L.GEMINI_NATIVE_MODELS_URL):
+        token = ""
+        if "pageToken=" in url:
+            token = url.split("pageToken=", 1)[1]
+        return _Resp(json.dumps(native_pages[token]).encode())
+    raise AssertionError(f"unexpected fetch: {url}")
+
+
+orig_urlopen = urllib.request.urlopen
+L.urllib.request.urlopen = fake_urlopen
+try:
+    seen_urls.clear()
+    got = L.gemini_chat_models("k")
+    ok("native list is read by capability, across pages, and name-filtered",
+       got == ["gemini-3.6-flash", "gemini-3.8-flash-preview"], got)
+    ok("native list sends the key as x-goog-api-key and pages with pageSize=1000",
+       len(seen_urls) == 2 and "pageSize=1000" in seen_urls[0] and "pageToken=p2" in seen_urls[1],
+       seen_urls)
+
+    reset_default_cache()
+    seen_urls.clear()
+    ok("(auto) resolves to the newest stable flash on the live list",
+       L.default_gemini_model("k") == "gemini-3.6-flash")
+    first_calls = len(seen_urls)
+    L.default_gemini_model("k")
+    ok("(auto) is cached per key, not fetched on every generation",
+       len(seen_urls) == first_calls, (first_calls, len(seen_urls)))
+finally:
+    L.urllib.request.urlopen = orig_urlopen
+    reset_default_cache()
+
+
+def failing_urlopen(req, timeout=None):
+    raise urllib.error.URLError("dns down")
+
+
+L.urllib.request.urlopen = failing_urlopen
+try:
+    got = L.gemini_chat_models("k", fallback_ids=["models/gemini-3.6-flash", "models/aqa"])
+    ok("native list unreachable -> the OpenAI-shaped list is filtered instead",
+       got == ["gemini-3.6-flash"], got)
+    reset_default_cache()
+    ok("(auto) without any list falls back to the constant, uncached",
+       L.default_gemini_model("k") == L.DEFAULT_GEMINI_MODEL
+       and L._GEMINI_DEFAULT_CACHE["id"] == "")
+finally:
+    L.urllib.request.urlopen = orig_urlopen
+    reset_default_cache()
+
+# --- Google's error body reaches the overlay; other remote bodies do not -----
+def http_error_urlopen(code, body):
+    def _open(req, timeout=None):
+        raise urllib.error.HTTPError(req.full_url, code, "Err", {}, io.BytesIO(body.encode()))
+    return _open
+
+
+google_404 = json.dumps({"error": {"code": 404, "status": "NOT_FOUND",
+                                   "message": "models/gemini-2.5-flash is not found"}})
+L.urllib.request.urlopen = http_error_urlopen(404, google_404)
+try:
+    try:
+        L._post_json(L.GEMINI_BASE_URL + "/chat/completions", {}, "k", 5)
+        ok("google 404 raises", False)
+    except L.LLMError as exc:
+        msg = str(exc)
+        ok("google error body is shown", "gemini-2.5-flash is not found" in msg, msg)
+        ok("google 404 carries the retired-model hint", "연결 확인" in msg and "(auto)" in msg, msg)
+    try:
+        L._post_json("https://example.com/v1/chat/completions", {}, "k", 5)
+        ok("other remote 404 raises", False)
+    except L.LLMError as exc:
+        ok("other remote hosts still get only the status line",
+           "not found" not in str(exc).lower() and "404" in str(exc), str(exc))
+finally:
+    L.urllib.request.urlopen = orig_urlopen
+
+quota0 = "Quota exceeded for metric: generate_content_free_tier_requests, limit: 0, model: gemini-3.1-pro"
+ok("429 with limit 0 -> no free tier hint", "무료 등급이 없습니다" in L.gemini_error_hint(429, quota0))
+ok("429 per-day quota -> daily hint",
+   "일일" in L.gemini_error_hint(429, '{"quotaId": "GenerateRequestsPerDayPerProjectPerModel-FreeTier"}'))
+ok("429 otherwise -> per-minute hint", "분당" in L.gemini_error_hint(429, "rate"))
+ok("400 bad key -> key hint", "aistudio.google.com/apikey" in L.gemini_error_hint(400, "API key not valid"))
+ok("403 -> permission hint", "권한" in L.gemini_error_hint(403, "PERMISSION_DENIED"))
+ok("unknown -> no hint", L.gemini_error_hint(500, "boom") == "")
 
 # --- env key routing ---------------------------------------------------------
 SAVED = {k: os.environ.pop(k, None) for k in
@@ -99,7 +237,11 @@ def fake_post(url, payload, api_key, timeout):
 
 
 orig_post = L._post_json
+orig_native = L._gemini_native_models
 L._post_json = fake_post
+L._gemini_native_models = lambda api_key, timeout: [
+    "models/gemini-3.6-flash", "models/gemini-3.8-flash-preview", "models/gemini-3.1-pro"]
+reset_default_cache()
 try:
     def call(thinking="auto", steps=()):
         sent.clear()
@@ -112,15 +254,16 @@ try:
     b = sent[0]["payload"]
     ok("request goes to Google's chat endpoint",
        sent[0]["url"] == L.GEMINI_BASE_URL + "/chat/completions", sent[0]["url"])
-    ok("default model fills in", b["model"] == L.DEFAULT_GEMINI_MODEL, b["model"])
+    ok("(auto) sends the live newest stable flash, not a name from the code",
+       b["model"] == "gemini-3.6-flash", b["model"])
     ok("auto sends no thinking fields",
        "reasoning_effort" not in b and "chat_template_kwargs" not in b)
     ok("no ttl/keep_alive to Google", "ttl" not in b and "keep_alive" not in b)
 
     call("off")
     b = sent[0]["payload"]
-    ok("off maps to reasoning_effort none",
-       b.get("reasoning_effort") == "none", b.get("reasoning_effort"))
+    ok("off maps to reasoning_effort low (3.x models reject none)",
+       b.get("reasoning_effort") == "low", b.get("reasoning_effort"))
     ok("off never appends /no_think for Gemini",
        not b["messages"][1]["content"].endswith("/no_think"), b["messages"][1]["content"])
     ok("off sends no Qwen template switch", "chat_template_kwargs" not in b)
@@ -129,13 +272,14 @@ try:
     ok("on maps to reasoning_effort high",
        sent[0]["payload"].get("reasoning_effort") == "high")
 
-    # A model that cannot switch thinking off (2.5-pro) rejects the field by name.
-    call("off", steps=("LLM server returned HTTP 400: reasoning_effort is not supported",))
+    # A model that does not take the field at all rejects it with a 400.
+    call("off", steps=("Gemini API returned HTTP 400: reasoning_effort is not supported",))
     ok("rejected reasoning_effort is shed and retried",
        len(sent) == 2 and "reasoning_effort" not in sent[1]["payload"], len(sent))
 
-    # A model whose output cap sits under the 60000 default.
-    call("auto", steps=("LLM server returned HTTP 400: max_tokens must be at most 8192",))
+    # A model whose output cap sits under the 60000 default — Google's wording.
+    call("auto", steps=('Gemini API returned HTTP 400: {"error": {"message": '
+                        '"max_output_tokens must be less than or equal to 8192"}}',))
     ok("rejected max_tokens is dropped so the model's own cap applies",
        len(sent) == 2 and "max_tokens" not in sent[1]["payload"]
        and sent[1]["payload"]["messages"] == sent[0]["payload"]["messages"], len(sent))
@@ -151,6 +295,8 @@ try:
        and b.get("chat_template_kwargs") == {"enable_thinking": False})
 finally:
     L._post_json = orig_post
+    L._gemini_native_models = orig_native
+    reset_default_cache()
 
 
 # --- warm-up must not spend a real (billable) request ------------------------
@@ -161,7 +307,7 @@ def boom(*a, **k):
 orig_post = L._post_json
 L._post_json = boom
 try:
-    r = L.warm_up_model("gemini", "", "", "gemini-2.5-flash")
+    r = L.warm_up_model("gemini", "", "", "gemini-3.6-flash")
 finally:
     L._post_json = orig_post
 ok("warm-up is a no-op for the cloud API", r["ok"] is True, r)
