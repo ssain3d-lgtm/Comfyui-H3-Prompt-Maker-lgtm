@@ -85,6 +85,17 @@ ok("a preview with a product suffix is a different product, never (auto)",
    L.pick_default_gemini_model(["gemini-2.0-flash-preview-image-generation"]) == L.DEFAULT_GEMINI_MODEL)
 ok("empty list -> the fallback constant",
    L.pick_default_gemini_model([]) == L.DEFAULT_GEMINI_MODEL)
+ok("the roomy-free-tier 3.5 flash is preferred over newer flashes (20 RPD free)",
+   L.pick_default_gemini_model(["gemini-3.8-flash", "gemini-3.5-flash", "gemini-3.6-flash"]) == "gemini-3.5-flash")
+ok("a 3.5 preview still beats a newer stable when no 3.5 stable is listed",
+   L.pick_default_gemini_model(["gemini-3.6-flash", "gemini-3.5-flash-preview-05-20"])
+   == "gemini-3.5-flash-preview-05-20")
+os.environ[L.GEMINI_DEFAULT_MODEL_ENV] = "models/gemini-3.7-flash"
+try:
+    ok("H3_GEMINI_DEFAULT_MODEL pins (auto), models/ prefix tolerated",
+       L.pick_default_gemini_model(["gemini-3.5-flash"]) == "gemini-3.7-flash")
+finally:
+    os.environ.pop(L.GEMINI_DEFAULT_MODEL_ENV, None)
 
 # --- native list: capability flags + paging, with the OpenAI list as fallback
 native_pages = {
