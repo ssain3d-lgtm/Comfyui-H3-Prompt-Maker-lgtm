@@ -188,6 +188,33 @@ def apply_thinking(user_text, mode):
     return f"{user_text}\n\n{token}"
 
 
+# What a server says when it stops without writing anything is the whole
+# diagnosis: "content_filter" is Google's safety filter closing the answer
+# (the "empty streaming response" people saw on Ref2VA scenes), "length" is
+# the token budget, a bare "stop" is the model itself.
+_SAFETY_HINT = ("안전 필터가 응답을 막았습니다. 요청은 safety_settings BLOCK_NONE으로 보내지만, "
+                "구글의 고정 필터(미성년·불법 콘텐츠 등)는 해제되지 않습니다. 장면·대사 표현을 "
+                "완화하거나 참조 사진을 바꿔 보세요. 로컬 모델에는 이 필터가 없습니다.")
+_EMPTY_ANSWER_HINTS = {
+    "content_filter": _SAFETY_HINT,
+    "safety": _SAFETY_HINT,
+    "prohibited_content": _SAFETY_HINT,
+    "recitation": "저작권 인용 필터에 걸렸습니다. 장면 요청을 바꿔 다시 시도하세요.",
+    "length": ("토큰 한도에 걸려 본문 없이 끝났습니다. max_tokens를 올리거나 thinking을 off로 "
+               "두세요."),
+}
+
+
+def _empty_answer_message(base, finish_reason):
+    reason = str(finish_reason or "").strip()
+    if not reason:
+        return base
+    hint = _EMPTY_ANSWER_HINTS.get(reason.lower())
+    if hint is None and any(word in reason.lower() for word in ("safety", "filter", "prohibited", "block")):
+        hint = _SAFETY_HINT
+    return f"{base} (finish_reason={reason})" + (f"\n→ {hint}" if hint else "")
+
+
 def _extract_text(data):
     """The answer, with a separately-returned reasoning block folded back in."""
     try:
@@ -204,7 +231,8 @@ def _extract_text(data):
     if reasoning and isinstance(reasoning, str) and reasoning.strip():
         text = f"<think>{reasoning}</think>\n{text or ''}"
     if not text or not text.strip():
-        raise LLMError("LLM returned an empty response.")
+        raise LLMError(_empty_answer_message("LLM returned an empty response.",
+                                             data["choices"][0].get("finish_reason")))
     return text
 
 
@@ -286,6 +314,15 @@ def _chat_payload(base_url, model, system_prompt, user_text, images_base64,
             payload["reasoning_effort"] = "low" if thinking == "off" else "high"
         else:
             payload["chat_template_kwargs"] = {"enable_thinking": thinking == "on"}
+    if gemini:
+        # AI Studio's "safety settings: off". Without it Google's default
+        # thresholds close a borderline answer with finish_reason=content_filter
+        # and no text at all. Sent through the compatibility layer's google
+        # extension; a server that does not know extra_body is retried
+        # without it by _retry_chat_payload.
+        payload["extra_body"] = {"google": {"safety_settings": [
+            {"category": category, "threshold": "BLOCK_NONE"}
+            for category in GEMINI_SAFETY_CATEGORIES]}}
     if stream:
         payload["stream"] = True
         # LM Studio and current OpenAI-compatible servers return exact token
@@ -308,7 +345,7 @@ def _retry_chat_payload(payload, message, gemini, controlled_text):
         return True
 
     optional = [k for k in ("stream_options", "chat_template_kwargs", "ttl", "keep_alive",
-                            "reasoning_effort") if k in payload]
+                            "reasoning_effort", "extra_body") if k in payload]
     optional_rejected = ("400" in msg or "template" in msg or "extra" in msg
                          or "unrecognized" in msg or "unknown" in msg)
     if optional and optional_rejected:
@@ -414,6 +451,7 @@ def _read_openai_stream(response, on_delta, cancel, started):
     content_chunks, reasoning_chunks, raw_chunks = [], [], []
     usage, stats = {}, {}
     first_token_at = None
+    finish_reason = None
     saw_sse = False
     try:
         for raw_line in response:
@@ -441,6 +479,8 @@ def _read_openai_stream(response, on_delta, cancel, started):
             if not isinstance(choices, list) or not choices:
                 continue
             choice = choices[0] if isinstance(choices[0], dict) else {}
+            if isinstance(choice.get("finish_reason"), str) and choice["finish_reason"]:
+                finish_reason = choice["finish_reason"]
             delta = choice.get("delta") if isinstance(choice.get("delta"), dict) else {}
             # A few compatible servers send a complete message in the last
             # chunk rather than deltas. Treat it as one final delta.
@@ -482,7 +522,8 @@ def _read_openai_stream(response, on_delta, cancel, started):
         reasoning = "".join(reasoning_chunks)
         answer = (f"<think>{reasoning}</think>\n{content}" if reasoning else content)
         if not answer.strip():
-            raise LLMError("LLM returned an empty streaming response.")
+            raise LLMError(_empty_answer_message("LLM returned an empty streaming response.",
+                                                 finish_reason))
 
     return answer, _stream_metrics(started, first_token_at, usage, stats, answer)
 
@@ -617,6 +658,10 @@ GEMINI_BASE_URL = f"https://{GEMINI_HOST}/v1beta/openai"
 # model can do (supportedGenerationMethods), so chat models are picked by
 # capability rather than by guessing from the name.
 GEMINI_NATIVE_MODELS_URL = f"https://{GEMINI_HOST}/v1beta/models"
+# The four thresholds AI Studio exposes as "safety settings"; BLOCK_NONE on all
+# of them is what its "Off" toggle sends.
+GEMINI_SAFETY_CATEGORIES = ("HARM_CATEGORY_HARASSMENT", "HARM_CATEGORY_HATE_SPEECH",
+                            "HARM_CATEGORY_SEXUALLY_EXPLICIT", "HARM_CATEGORY_DANGEROUS_CONTENT")
 # Last resort only, when the live list cannot be read. Google retires a Flash
 # generation roughly yearly (2.5 Flash went dark on 2026-06-17 and took the
 # previous hard-coded default with it), so the list is authoritative and this

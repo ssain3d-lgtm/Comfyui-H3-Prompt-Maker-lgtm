@@ -14,6 +14,7 @@ import json
 import os
 import pathlib
 import sys
+import time
 import urllib.error
 
 P = pathlib.Path(__file__).resolve().parent.parent
@@ -311,6 +312,57 @@ try:
 finally:
     L._post_json = orig_post
 ok("warm-up is a no-op for the cloud API", r["ok"] is True, r)
+
+# --- safety settings + empty-answer diagnosis --------------------------------
+payload, _text, is_g = L._chat_payload(L.GEMINI_BASE_URL, "gemini-3.6-flash", "sys", "장면",
+                                       None, None, 0.7, -1, 60000, "off", "keep", "gemini")
+ok("gemini requests carry AI Studio's safety-off settings",
+   is_g and payload.get("extra_body") == {"google": {"safety_settings": [
+       {"category": c, "threshold": "BLOCK_NONE"} for c in L.GEMINI_SAFETY_CATEGORIES]}},
+   payload.get("extra_body"))
+payload, _text, is_g = L._chat_payload("http://127.0.0.1:1234/v1", "m", "sys", "장면",
+                                       None, None, 0.7, -1, 60000, "off", "keep", "lmstudio")
+ok("local requests carry no google extension", not is_g and "extra_body" not in payload)
+
+payload = {"messages": [{"role": "system", "content": "s"}, {"role": "user", "content": "u"}],
+           "extra_body": {"google": {}}, "max_tokens": 60000}
+ok("a server that rejects extra_body is retried without it",
+   L._retry_chat_payload(payload, 'Gemini API returned HTTP 400: Unknown name "extra_body"', True, "u")
+   and "extra_body" not in payload, payload)
+
+try:
+    L._extract_text({"choices": [{"message": {"content": ""}, "finish_reason": "content_filter"}]})
+    ok("empty non-streamed answer raises", False)
+except L.LLMError as exc:
+    ok("empty answer names the finish reason and the safety filter",
+       "finish_reason=content_filter" in str(exc) and "안전 필터" in str(exc), str(exc))
+
+sse = [
+    b'data: {"choices":[{"delta":{"role":"assistant","content":""},"finish_reason":null}]}\n',
+    b'data: {"choices":[{"delta":{},"finish_reason":"content_filter"}]}\n',
+    b'data: [DONE]\n',
+]
+try:
+    L._read_openai_stream(iter(sse), None, None, time.perf_counter())
+    ok("empty stream raises", False)
+except L.LLMError as exc:
+    ok("empty stream names the finish reason and the safety filter",
+       "finish_reason=content_filter" in str(exc) and "안전 필터" in str(exc), str(exc))
+
+sse_len = [b'data: {"choices":[{"delta":{"content":""},"finish_reason":"length"}]}\n',
+           b'data: [DONE]\n']
+try:
+    L._read_openai_stream(iter(sse_len), None, None, time.perf_counter())
+    ok("length-cut empty stream raises", False)
+except L.LLMError as exc:
+    ok("a token-budget cut is reported as such",
+       "finish_reason=length" in str(exc) and "토큰" in str(exc), str(exc))
+
+sse_ok = [b'data: {"choices":[{"delta":{"content":"hello"},"finish_reason":null}]}\n',
+          b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n',
+          b'data: [DONE]\n']
+answer, metrics = L._read_openai_stream(iter(sse_ok), None, None, time.perf_counter())
+ok("a normal stream still returns its text", answer == "hello" and metrics["streamed"] is True)
 
 if fails:
     print("GEMINI BACKEND TESTS FAILED")
