@@ -665,9 +665,16 @@ GEMINI_SAFETY_CATEGORIES = ("HARM_CATEGORY_HARASSMENT", "HARM_CATEGORY_HATE_SPEE
 # Last resort only, when the live list cannot be read. Google retires a Flash
 # generation roughly yearly (2.5 Flash went dark on 2026-06-17 and took the
 # previous hard-coded default with it), so the list is authoritative and this
-# is the fallback: the newest stable Flash at the time of writing, free tier
-# 10 RPM / 1,500 requests a day.
-DEFAULT_GEMINI_MODEL = "gemini-3.6-flash"
+# is the fallback.
+DEFAULT_GEMINI_MODEL = "gemini-3.5-flash"
+# Newest is not best on the free tier: Google gives the current Flash
+# generation (3.6/3.7/3.8) about 20 requests a day for free, while 3.5 Flash
+# keeps roughly 1,500. (auto) therefore prefers these versions for as long as
+# Google still lists them, and only then falls through to the newest Flash.
+PREFERRED_FLASH_VERSIONS = ("3.5",)
+# Pins (auto) without a code change, e.g. once a newer generation regains a
+# usable free tier: export H3_GEMINI_DEFAULT_MODEL=gemini-3.7-flash
+GEMINI_DEFAULT_MODEL_ENV = "H3_GEMINI_DEFAULT_MODEL"
 
 
 def is_gemini_target(url):
@@ -806,22 +813,36 @@ def _version_key(text):
 
 
 def pick_default_gemini_model(ids):
-    """The newest stable `gemini-N-flash`, a preview only when no stable exists.
+    """What (auto) runs: the Flash with the roomy free tier, else the newest.
 
-    Flash is the free-tier workhorse (1,500 requests a day on 3.6) and the
-    closest match to what the web app ran on; Pro models have no free quota.
-    Picking from the live list is what keeps (auto) working when Google
+    In order: an explicit $H3_GEMINI_DEFAULT_MODEL; a stable, then a preview
+    build of each PREFERRED_FLASH_VERSIONS entry Google still lists; the
+    newest stable `gemini-N-flash`, a preview only when no stable exists; the
+    fixed fallback. Flash rather than Pro because Pro has no free quota at
+    all. Picking from the live list is what keeps (auto) working when Google
     retires a generation — which is exactly how the old fixed default died.
     """
-    stable, preview = [], []
+    override = os.environ.get(GEMINI_DEFAULT_MODEL_ENV, "").strip()
+    if override:
+        return override[len("models/"):] if override.startswith("models/") else override
+    entries = []   # (version text, version key, id, is_preview)
     for mid in ids or []:
         m = _FLASH_RE.match(mid) if isinstance(mid, str) else None
-        if not m:
-            continue
-        (preview if m.group(2) else stable).append((_version_key(m.group(1)), mid))
-    for pool in (stable, preview):
+        if m:
+            entries.append((m.group(1), _version_key(m.group(1)), mid, bool(m.group(2))))
+
+    def newest(pool):
+        return max(pool, key=lambda e: (e[1], e[2]))[2]
+
+    for version in PREFERRED_FLASH_VERSIONS:
+        for is_preview in (False, True):
+            hits = [e for e in entries if e[0] == version and e[3] == is_preview]
+            if hits:
+                return newest(hits)
+    for is_preview in (False, True):
+        pool = [e for e in entries if e[3] == is_preview]
         if pool:
-            return max(pool)[1]
+            return newest(pool)
     return DEFAULT_GEMINI_MODEL
 
 
@@ -856,7 +877,7 @@ def gemini_error_hint(code, body):
                     f"(예: {DEFAULT_GEMINI_MODEL}, 무료 일 1,500회)을 고르거나 결제를 활성화하세요.")
         if "perday" in low or "per day" in low:
             return "\n→ 오늘의 무료 일일 한도를 다 썼습니다. 내일 다시 시도하거나 결제를 활성화하세요."
-        return ("\n→ 분당 한도(무료 등급 Flash 10회/분) 초과입니다. 잠시 후 다시 시도하세요. "
+        return ("\n→ 분당 한도(무료 등급 Flash 10~15회/분) 초과입니다. 잠시 후 다시 시도하세요. "
                 "Queue에 여러 개를 한 번에 넣었다면 그게 원인입니다.")
     if code in (400, 401) and ("api key" in low or "api_key" in low):
         return ("\n→ API 키가 올바르지 않습니다. https://aistudio.google.com/apikey 에서 발급한 키를 "
