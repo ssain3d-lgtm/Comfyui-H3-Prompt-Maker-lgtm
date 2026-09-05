@@ -16,9 +16,11 @@ Two families:
 import base64
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
+import time
 import urllib.parse
 import urllib.request
 import urllib.error
@@ -40,13 +42,19 @@ def _post_json(url, payload, api_key, timeout):
             return json.loads(res.read().decode("utf-8", errors="replace"))
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")[:2000]
-        # The reply body is the fastest way to see why a local server said no,
-        # so it goes to the caller — but only for loopback. base_url arrives in
-        # a request body, and echoing a remote reply turns this route into a
-        # read primitive against anything the ComfyUI host can reach. For those,
-        # the status line goes back and the body stays in the console.
+        # The reply body is the fastest way to see why a server said no, so it
+        # goes to the caller — but only for loopback and for Google's pinned
+        # host. base_url arrives in a request body, and echoing an arbitrary
+        # remote reply turns this route into a read primitive against anything
+        # the ComfyUI host can reach. Google's API is not that: its error body
+        # is a JSON status (retired model, quota, bad key) and is exactly what
+        # the person at the overlay needs. Everything else: status line back,
+        # body to the console.
         if is_local_target(url):
             raise LLMError(f"LLM server returned HTTP {e.code}: {body}") from e
+        if is_gemini_target(url):
+            raise LLMError(f"Gemini API returned HTTP {e.code}: {body}"
+                           + gemini_error_hint(e.code, body)) from e
         print(f"[h3_prompt_maker] HTTP {e.code} from {url}: {body}", flush=True)
         raise LLMError(
             f"LLM server returned HTTP {e.code}. 원격 주소라 응답 본문은 ComfyUI 콘솔에만 남깁니다."
@@ -248,7 +256,8 @@ def call_openai_compatible(base_url, model, api_key, system_prompt, user_text,
             break
         except LLMError as exc:
             msg = str(exc).lower()
-            if gemini and "max_tokens" in payload and "max_tokens" in msg:
+            if gemini and "max_tokens" in payload and (
+                    "max_tokens" in msg or "max_output_tokens" in msg or "output token" in msg):
                 # The 60000 default is headroom for local reasoning models, but
                 # it sits above some Gemini models' output cap and Google
                 # rejects it by name. Dropping the field falls back to that
@@ -337,7 +346,16 @@ AUTO_MODEL = "(auto)"
 # knows. Host is pinned here: key routing below trusts it by name.
 GEMINI_HOST = "generativelanguage.googleapis.com"
 GEMINI_BASE_URL = f"https://{GEMINI_HOST}/v1beta/openai"
-DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
+# Google's own model list. Unlike the OpenAI-shaped one it says what each
+# model can do (supportedGenerationMethods), so chat models are picked by
+# capability rather than by guessing from the name.
+GEMINI_NATIVE_MODELS_URL = f"https://{GEMINI_HOST}/v1beta/models"
+# Last resort only, when the live list cannot be read. Google retires a Flash
+# generation roughly yearly (2.5 Flash went dark on 2026-06-17 and took the
+# previous hard-coded default with it), so the list is authoritative and this
+# is the fallback: the newest stable Flash at the time of writing, free tier
+# 10 RPM / 1,500 requests a day.
+DEFAULT_GEMINI_MODEL = "gemini-3.6-flash"
 
 
 def is_gemini_target(url):
@@ -419,6 +437,122 @@ def filter_gemini_chat_models(ids):
         if base and base not in out:
             out.append(base)
     return out
+
+
+def _gemini_native_models(api_key, timeout):
+    """Every model Google lists for this key that answers generateContent.
+
+    Follows nextPageToken: the list is past fifty entries and the newest
+    models sit wherever Google puts them, so a single page is not enough.
+    """
+    names, token, pages = [], "", 0
+    while pages < 10:
+        query = "?pageSize=1000" + (f"&pageToken={urllib.parse.quote(token)}" if token else "")
+        req = urllib.request.Request(GEMINI_NATIVE_MODELS_URL + query,
+                                     headers={"x-goog-api-key": api_key})
+        with urllib.request.urlopen(req, timeout=timeout) as res:
+            payload = json.loads(res.read().decode("utf-8", errors="replace"))
+        rows = payload.get("models") if isinstance(payload, dict) else None
+        if not isinstance(rows, list):
+            raise LLMError(f"Unexpected model list shape: {str(payload)[:200]}")
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            methods = row.get("supportedGenerationMethods") or []
+            if "generateContent" in methods and isinstance(row.get("name"), str):
+                names.append(row["name"])
+        token = payload.get("nextPageToken") or ""
+        pages += 1
+        if not token:
+            break
+    return names
+
+
+def gemini_chat_models(api_key, timeout=6.0, fallback_ids=None):
+    """Chat-capable Gemini ids for this key, newest source first.
+
+    The native list is authoritative (capability flags, all pages). If it
+    cannot be read the OpenAI-shaped ids already fetched by the probe are
+    filtered by name instead, so the dialog still gets a list.
+    """
+    try:
+        return filter_gemini_chat_models(_gemini_native_models(api_key, timeout))
+    except Exception as exc:  # noqa: BLE001 — a degraded list beats no list
+        print(f"[h3_prompt_maker] Gemini native model list unavailable ({exc}); "
+              f"falling back to the OpenAI-compatible list", flush=True)
+        return filter_gemini_chat_models(fallback_ids or [])
+
+
+# gemini-3.6-flash / gemini-3-flash-preview / gemini-3.8-flash-preview-05-20.
+# A preview suffix may only be a date or build number: letters after -preview
+# name a different product (-preview-image-generation), as do -lite and -tts.
+_FLASH_RE = re.compile(r"^gemini-(\d+(?:\.\d+)*)-flash(-preview(?:-[\d.-]+)?)?$")
+
+
+def _version_key(text):
+    return tuple(int(part) for part in text.split("."))
+
+
+def pick_default_gemini_model(ids):
+    """The newest stable `gemini-N-flash`, a preview only when no stable exists.
+
+    Flash is the free-tier workhorse (1,500 requests a day on 3.6) and the
+    closest match to what the web app ran on; Pro models have no free quota.
+    Picking from the live list is what keeps (auto) working when Google
+    retires a generation — which is exactly how the old fixed default died.
+    """
+    stable, preview = [], []
+    for mid in ids or []:
+        m = _FLASH_RE.match(mid) if isinstance(mid, str) else None
+        if not m:
+            continue
+        (preview if m.group(2) else stable).append((_version_key(m.group(1)), mid))
+    for pool in (stable, preview):
+        if pool:
+            return max(pool)[1]
+    return DEFAULT_GEMINI_MODEL
+
+
+_GEMINI_DEFAULT_CACHE = {"at": 0.0, "key": "", "id": ""}
+_GEMINI_DEFAULT_TTL = 600.0
+
+
+def default_gemini_model(api_key, timeout=6.0):
+    """What (auto) means for Gemini right now, cached briefly per key."""
+    now = time.time()
+    cache = _GEMINI_DEFAULT_CACHE
+    if cache["id"] and cache["key"] == api_key and now - cache["at"] < _GEMINI_DEFAULT_TTL:
+        return cache["id"]
+    ids = gemini_chat_models(api_key, timeout)
+    pick = pick_default_gemini_model(ids)
+    if ids:
+        cache.update({"at": now, "key": api_key, "id": pick})
+    return pick
+
+
+def gemini_error_hint(code, body):
+    """One line telling the person at the overlay what to do about Google's answer."""
+    low = (body or "").lower()
+    if code == 404 or "not_found" in low:
+        return ("\n→ 이 모델 ID는 더 이상 없습니다. 구글은 구세대 모델을 순차 종료합니다 "
+                "(2.5 Flash/Pro 2026-06-17, 2.5 Flash-Lite 2026-07-22). ⚙️ 모델 연결에서 "
+                "🔌 연결 확인을 눌러 현재 목록에서 다시 고르거나, (auto)로 두면 최신 안정 Flash를 "
+                "자동으로 씁니다.")
+    if code == 429:
+        if "limit: 0" in low:
+            return ("\n→ 이 모델은 무료 등급이 없습니다 (limit 0). Flash 계열"
+                    f"(예: {DEFAULT_GEMINI_MODEL}, 무료 일 1,500회)을 고르거나 결제를 활성화하세요.")
+        if "perday" in low or "per day" in low:
+            return "\n→ 오늘의 무료 일일 한도를 다 썼습니다. 내일 다시 시도하거나 결제를 활성화하세요."
+        return ("\n→ 분당 한도(무료 등급 Flash 10회/분) 초과입니다. 잠시 후 다시 시도하세요. "
+                "Queue에 여러 개를 한 번에 넣었다면 그게 원인입니다.")
+    if code in (400, 401) and ("api key" in low or "api_key" in low):
+        return ("\n→ API 키가 올바르지 않습니다. https://aistudio.google.com/apikey 에서 발급한 키를 "
+                "API 키 칸에 넣거나 GEMINI_API_KEY 환경변수로 두세요.")
+    if code == 403:
+        return ("\n→ 키 권한 문제입니다. AI Studio에서 만든 키인지, 프로젝트에 Generative Language API가 "
+                "켜져 있는지, 무료 등급 지원 지역인지 확인하세요.")
+    return ""
 
 
 def _filter_lmstudio_chat_models(openai_ids, metadata):
@@ -645,13 +779,13 @@ def resolve_backend(backend, base_url, model, cli_command, server_model=AUTO_MOD
     if server_model and server_model != AUTO_MODEL:
         mdl = server_model
     if backend == "gemini" or is_gemini_target(url):
-        # Google's list endpoint says "models/gemini-2.5-flash" while the chat
-        # endpoint wants the bare id; and unlike a local server, an empty model
-        # here would 404 rather than mean "whatever is loaded".
+        # Google's list endpoint says "models/gemini-3.6-flash" while the chat
+        # endpoint wants the bare id. An empty model stays empty here: it means
+        # (auto), which call_llm resolves against the live list — a fixed name
+        # in this spot is how the retired 2.5 Flash became a 404 for everyone.
         mdl = (mdl or "").strip()
         if mdl.startswith("models/"):
             mdl = mdl[len("models/"):]
-        mdl = mdl or DEFAULT_GEMINI_MODEL
     return ("http", url, mdl, "")
 
 
@@ -726,6 +860,9 @@ def call_llm(backend, base_url, model, api_key, cli_command, system_prompt,
         # A CLI runner has no template switch; the text token is all there is.
         return call_cli(cmd, system_prompt, apply_thinking(user_text, thinking), timeout=timeout)
     api_key = resolve_api_key(api_key, url)
+    if is_gemini_target(url) and not mdl:
+        mdl = default_gemini_model(api_key, timeout=min(timeout, 8.0))
+        print(f"[h3_prompt_maker] gemini (auto) → {mdl}", flush=True)
     return call_openai_compatible(url, mdl, api_key, system_prompt, user_text,
                                   images_base64=images_base64, temperature=temperature,
                                    seed=seed, timeout=timeout, max_tokens=max_tokens,
@@ -785,12 +922,15 @@ def probe_backend(backend, base_url, api_key, cli_command, timeout=6.0):
                           f"서버가 켜져 있고 주소가 맞는지 확인하세요."}
 
     models = _model_ids(payload)
+    detail = ""
     if normalize_backend(backend) == "lmstudio":
         models = _lmstudio_chat_models(url, key, timeout, models)
     elif is_gemini_target(url):
-        models = filter_gemini_chat_models(models)
+        models = gemini_chat_models(key, timeout, fallback_ids=models)
+        # Say what (auto) will run, so nobody has to guess which Flash is current.
+        detail = f" · (auto) = {pick_default_gemini_model(models)}"
     return {"ok": True, "kind": "http", "models": models, "target": url,
-            "detail": f"모델 {len(models)}개 확인됨"}
+            "detail": f"모델 {len(models)}개 확인됨{detail}"}
 
 
 def warm_up_model(backend, base_url, api_key, model, timeout=180.0):

@@ -229,8 +229,8 @@ _BACKEND_INPUTS = {
         "default": "lmstudio",
         "tooltip": "lmstudio/ollama/llamacpp/vllm = local OpenAI-compatible servers on their "
                    "standard ports (1234/11434/8080/8000) — nothing else to type. "
-                   "gemini = Google Gemini API (needs a GEMINI_API_KEY; model defaults to "
-                   "gemini-2.5-flash — the web app's Google models). "
+                   "gemini = Google Gemini API (needs a GEMINI_API_KEY; an empty model means "
+                   "the newest stable Flash from Google's live list — the web app's models). "
                    "openai_compat = any other OpenAI-compatible address (OpenRouter, "
                    "remote server) via base_url. claude_cli/gemini_cli/codex_cli = "
                    "subscription CLIs. custom_cli = your own stdin->stdout command."}),
@@ -240,7 +240,7 @@ _BACKEND_INPUTS = {
     "model": ("STRING", {"default": "",
         "tooltip": "Model name typed by hand. The server_model dropdown below wins "
                    "when it is not (auto). Empty = the server's loaded/default model "
-                   "(gemini backend: gemini-2.5-flash)."}),
+                   "(gemini backend: the newest stable Flash on Google's live list)."}),
     "api_key": ("STRING", {"default": "", "password": True,
         "tooltip": "Only needed for paid endpoints (Gemini, OpenRouter, OpenAI). "
                    "Local servers ignore it. Leave empty to read the environment instead "
