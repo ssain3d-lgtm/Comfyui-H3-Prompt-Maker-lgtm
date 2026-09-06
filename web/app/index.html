@@ -60,10 +60,43 @@
           transition-duration: 0.01ms !important;
         }
       }
+      /* Korean does not break inside a word the way English does, so the
+         browser default splits phrases mid-syllable-block and the text reads
+         loose and ragged. keep-all is the correct rule; anywhere keeps a long
+         unbreakable token (a URL, a model id) from overflowing the box. */
+      .h3-ko {
+        word-break: keep-all;
+        overflow-wrap: anywhere;
+      }
+      /* Short viewports — the ComfyUI overlay is routinely 800x600 or less.
+         At that height the mode picker, the drop zone and the settings grid
+         filled the entire first screen and the scene textarea, the one field
+         you type in every single time, sat below the fold with nothing on
+         screen suggesting it was there.
+
+         The column is a flexbox, so `order` moves the scene request above the
+         attachment chrome without touching the DOM or the tall-screen layout.
+         Hand-written CSS rather than a Tailwind variant: tools/check_tailwind
+         only validates the standard prefixes, so a custom one could silently
+         fail to make it into the offline stylesheet. */
+      @media (max-height: 820px) {
+        .h3-attach-zone,
+        .h3-attach-buttons,
+        .h3-settings { order: 1; }
+        .h3-generate { order: 2; }
+        .h3-attach-zone { height: 5rem !important; padding: 0.5rem !important; }
+        .h3-drop-sub,
+        .h3-mode-tag,
+        .h3-mode-desc { display: none !important; }
+      }
+      @media (max-height: 680px) {
+        /* Tighter still: at 600px the header alone takes a tenth of the screen. */
+        .h3-attach-zone { height: 4rem !important; }
+      }
     </style>
   
 <link rel="stylesheet" href="./index.css">
-  <script type="module" crossorigin src="./assets/index-Dd7ngieh.js"></script>
+  <script type="module" crossorigin src="./assets/index-B3Ljh8LD.js"></script>
 </head>
   <body>
     <div id="root"></div>
