@@ -16,6 +16,7 @@ import json
 import mimetypes
 import pathlib
 import time
+import urllib.parse
 import traceback
 
 from .h3_prompts import build_system_prompt, nearest_grid_frames
@@ -41,10 +42,15 @@ PROMPT_PROFILES = ("fast", "full")
 
 def _safe_asset(rel: str):
     """Resolve rel inside APP_DIR or return None. Rejects traversal and odd types."""
-    target = (APP_DIR / rel.lstrip("/")).resolve()
     try:
+        target = (APP_DIR / rel.lstrip("/")).resolve()
         target.relative_to(APP_DIR.resolve())
     except ValueError:
+        # Traversal, or a path the OS will not even parse: a %00 in the URL
+        # made resolve() raise "embedded null byte", which reached the browser
+        # as a 500 and a traceback in the ComfyUI console instead of a 404.
+        return None
+    except OSError:
         return None
     if not target.is_file() or target.suffix.lower() not in _ALLOWED_EXT:
         return None
@@ -355,6 +361,49 @@ async def _stream_generation(request, cfg, system_prompt, user_text, send_images
     return response
 
 
+def _cross_site(request):
+    """True when a browser sent this request from a different site.
+
+    ComfyUI has no authentication of its own, and these routes have real side
+    effects: they load and unload the user's model, and resolve_api_key hands
+    an environment key to Google's pinned host with no interaction. A page the
+    user happens to have open could POST here — no preflight is needed for a
+    text/plain body — and while it could not read the reply, the side effects
+    would land, on the user's billable key.
+
+    Only a browser attaches Origin and Sec-Fetch-Site automatically, so an
+    absent Origin means a tool (curl, a script, the node itself) and is not a
+    CSRF vector. Reject a present-and-different one.
+    """
+    if str(request.headers.get("Sec-Fetch-Site") or "").lower() == "cross-site":
+        return True
+    origin = str(request.headers.get("Origin") or "").strip()
+    if not origin:
+        return False
+    # A sandboxed frame or a downloaded file:// page sends "null". The overlay
+    # is served by ComfyUI and is same-origin with it, so this never comes from
+    # anything legitimate here.
+    if origin.lower() == "null":
+        return True
+    host = str(request.headers.get("Host") or "").strip()
+    if not host:
+        return False
+    try:
+        return urllib.parse.urlsplit(origin).netloc.lower() != host.lower()
+    except ValueError:
+        return True
+
+
+def _same_site_only(handler):
+    """Guard a mutating route against a cross-site browser POST."""
+    @functools.wraps(handler)
+    async def guarded(request):
+        if _cross_site(request):
+            return _json({"error": "다른 사이트에서 보낸 요청은 처리하지 않습니다."}, status=403)
+        return await handler(request)
+    return guarded
+
+
 def register(routes):
     @routes.get(PREFIX + "/api/health")
     async def health(request):
@@ -373,6 +422,7 @@ def register(routes):
         })
 
     @routes.post(PREFIX + "/api/probe")
+    @_same_site_only
     async def probe(request):
         """Reachability check for the settings dialog's 연결 확인 button."""
         try:
@@ -384,6 +434,7 @@ def register(routes):
                                       cfg["api_key"], cfg["cli_command"]))
 
     @routes.post(PREFIX + "/api/load-model")
+    @_same_site_only
     async def load_model(request):
         """Ask the server to page the chosen model into memory before it is needed."""
         try:
@@ -398,6 +449,7 @@ def register(routes):
                                       cfg["api_key"], model))
 
     @routes.post(PREFIX + "/api/unload-model")
+    @_same_site_only
     async def unload_selected_model(request):
         """Release the chosen local model on demand or when the overlay closes."""
         try:
@@ -413,12 +465,14 @@ def register(routes):
                                       cfg["api_key"], model))
 
     @routes.post(PREFIX + "/api/edit-image")
+    @_same_site_only
     async def edit_image(request):
         # Kept so a stale bundle gets a real answer instead of a 404 page.
         return _json({"error": "이미지 편집은 Gemini 전용 기능입니다. "
                                "ComfyUI에서는 인페인트 노드를 사용하세요."}, status=501)
 
     @routes.post(PREFIX + "/api/generate-prompt")
+    @_same_site_only
     async def generate_prompt(request):
         try:
             raw = await _read_body(request)

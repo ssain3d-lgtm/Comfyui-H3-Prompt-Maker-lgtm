@@ -23,6 +23,10 @@ L = importlib.import_module("h3u.llm_backends")
 
 MODEL = "qwen3.8-27b-uncensored"
 state = {"loaded": None, "jit": True}
+# When set, the first chat request is refused for a reason that has nothing
+# to do with the keep-alive fields — which is exactly when the retry ladder
+# used to throw the unload instruction away along with everything else.
+reject_once = {"armed": False}
 log = []
 
 
@@ -50,6 +54,12 @@ class Server(BaseHTTPRequestHandler):
             log.append({"kind": "load", "model": want})
             state["loaded"] = want
             return self._send(200, {"type": "llm", "instance_id": want, "status": "loaded"})
+        if self.path.endswith("/api/generate"):
+            # Ollama's own unload endpoint: keep_alive 0 evicts the model.
+            log.append({"kind": "unload", "model": body.get("model")})
+            if body.get("keep_alive") == 0 and state["loaded"] == body.get("model"):
+                state["loaded"] = None
+            return self._send(200, {"done": True})
         if self.path.endswith("/api/v1/models/unload"):
             instance = body.get("instance_id")
             log.append({"kind": "unload", "model": instance})
@@ -58,6 +68,12 @@ class Server(BaseHTTPRequestHandler):
             return self._send(200, {"instance_id": instance})
 
         want = body.get("model")
+        if reject_once["armed"] and body.get("max_tokens") != 1:
+            reject_once["armed"] = False
+            log.append({"kind": "reject", "model": want, "ttl": body.get("ttl"),
+                        "keep_alive": body.get("keep_alive"), "loaded_before": state["loaded"]})
+            return self._send(400, {"error": {"message":
+                "400: unrecognized field 'chat_template_kwargs'"}})
         is_ping = body.get("max_tokens") == 1
         log.append({"kind": "ping" if is_ping else "gen", "model": want, "ping": is_ping, "ttl": body.get("ttl"),
                     "keep_alive": body.get("keep_alive"), "loaded_before": state["loaded"]})
@@ -140,6 +156,18 @@ eq("ollama: no LM Studio ttl is sent", log[0]["ttl"], None)
 eq("ollama: keep_alive=0 unloads immediately", log[0]["keep_alive"], 0)
 eq("ollama: the model is gone afterwards", state["loaded"], None)
 
+# An unrelated 400 costs the whole optional group, keep_alive included — so the
+# request that finally succeeds carries no unload instruction at all. Ollama has
+# no post-generation native unload to fall back on, so without compensation the
+# model just stays in VRAM and nothing says so.
+state["loaded"], reject_once["armed"] = MODEL, True
+generate("now", "ollama")
+kinds = [e["kind"] for e in log]
+eq("shed+unload: the first request is refused, the retry succeeds", kinds[:2], ["reject", "gen"])
+eq("shed+unload: the retry really did lose keep_alive", log[1]["keep_alive"], None)
+eq("shed+unload: so the unload is issued explicitly instead", kinds[-1], "unload")
+eq("shed+unload: and the model is actually gone", state["loaded"], None)
+
 # --- the reload half --------------------------------------------------------
 # This is the state the previous case leaves behind: nothing in memory.
 eq("reload: memory really is empty going in", state["loaded"], None)
@@ -178,8 +206,11 @@ R = importlib.import_module("h3u.server_routes")
 
 
 class FakeReq:
-    def __init__(self, payload):
+    def __init__(self, payload, headers=None):
         self._b = json.dumps(payload).encode()
+        # The routes are wrapped in the cross-site guard, which reads these.
+        # No Origin at all is what a tool sends, and is allowed.
+        self.headers = headers or {}
 
     @property
     def content(self):

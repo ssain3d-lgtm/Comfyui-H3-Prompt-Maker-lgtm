@@ -31,6 +31,57 @@ const eq = (n, a, b) => ok(n, a === b, `expected ${JSON.stringify(b)}, got ${JSO
 const LONG = 'aiconjured/qwen3.8-27b-uncensored-hauhaucs-aggressive-mtp-gguf-q8-nvfp4/'
   + 'qwen3.8-27b-uncensored-hauhaucs-aggressive-nvfp4-mixed.gguf';
 
+// --- the host bridge boundary ------------------------------------------------
+// The overlay half (platform.ts) has always checked the origin and the sending
+// window. The host half checked only the `source` string, which any sender can
+// write — so any frame holding a handle to the ComfyUI window could post an
+// "apply" while the overlay was open and overwrite the node's result widget,
+// which is what feeds the downstream sockets. Pinned as source text because
+// the listener closes over module state that cannot be stood up here.
+const listener = src.slice(src.indexOf('window.addEventListener("message"'));
+ok('bridge: the sender origin is checked',
+  /e\.origin\s*!==\s*window\.location\.origin/.test(listener), listener.slice(0, 200));
+ok('bridge: the sending window is checked, not just the source string',
+  /e\.source\s*!==\s*overlay\?\.frame\?\.contentWindow/.test(listener));
+ok('bridge: both checks come before the payload is trusted',
+  listener.indexOf('e.origin') < listener.indexOf('d.type'));
+ok('bridge: outbound messages name a concrete target origin, not "*"',
+  /postMessage\(\s*\{[^}]*\},\s*window\.location\.origin\s*\)/s.test(src)
+  && !/postMessage\([^)]*,\s*"\*"\s*\)/s.test(src));
+
+// --- saved-settings migration -------------------------------------------------
+// readLlm rewrites every pre-optimization workflow on first open. It had no
+// test at all, and it is the one function here that mutates the user's file.
+const { readLlm, DEFAULT_LLM } = new Function(
+  'const readJson = (node, name, fb) => node.__llm ?? fb;'
+  + 'const writeJson = (node, name, value) => { node.__written = value; };'
+  + src.slice(src.indexOf('const DEFAULT_LLM = '), src.indexOf('\n};', src.indexOf('const DEFAULT_LLM = ')) + 3)
+  + grab('readLlm')
+  + 'return { readLlm, DEFAULT_LLM };')();
+
+eq('migrate: a fresh node with nothing saved gets the fast defaults',
+  [readLlm({}).thinking, readLlm({}).unload_after, readLlm({}).prompt_profile].join(','),
+  'off,close,fast');
+ok('migrate: an empty node is not written back to — nothing changed',
+  new Function('const readJson=(n,k,f)=>f;const writeJson=(n,k,v)=>{n.__written=v;};'
+    + src.slice(src.indexOf('const DEFAULT_LLM = '), src.indexOf('\n};', src.indexOf('const DEFAULT_LLM = ')) + 3)
+    + grab('readLlm') + 'const n={};readLlm(n);return n.__written===undefined;')());
+
+const old1 = { __llm: { backend: 'lmstudio', thinking: 'auto', unload_after: 'now', max_tokens: 60000 } };
+const migrated = readLlm(old1);
+eq('migrate: a v1 workflow moves off the slow defaults',
+  [migrated.thinking, migrated.unload_after, migrated.prompt_profile].join(','), 'off,close,fast');
+eq('migrate: it is stamped so it never migrates twice', migrated.settings_version, 2);
+ok('migrate: the change is written back to the widget', old1.__written !== undefined);
+eq('migrate: unrelated saved values survive', migrated.max_tokens, 60000);
+
+const v2 = { __llm: { settings_version: 2, thinking: 'auto', unload_after: 'now', prompt_profile: 'full' } };
+const kept = readLlm(v2);
+eq('migrate: a deliberate post-release choice of auto is never overwritten', kept.thinking, 'auto');
+eq('migrate: ...nor a deliberate 즉시 언로드', kept.unload_after, 'now');
+eq('migrate: ...nor a deliberate Full profile', kept.prompt_profile, 'full');
+ok('migrate: a v2 node is left alone on disk', v2.__written === undefined);
+
 // --- the id itself ----------------------------------------------------------
 eq('label: a repository path shows only the build',
   modelLabel(LONG), 'qwen3.8-27b-uncensored-hauhaucs-aggressive-nvfp4-mixed.gguf');

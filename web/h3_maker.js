@@ -281,7 +281,7 @@ const requestModelUnload = async (cfg) => {
 
 const sendToOverlay = (type, payload) => {
   overlay?.frame?.contentWindow?.postMessage(
-    { source: "h3-prompt-maker-host", type, payload }, "*");
+    { source: "h3-prompt-maker-host", type, payload }, window.location.origin);
 };
 
 const openOverlay = (node) => {
@@ -299,6 +299,14 @@ const pushNodeState = (node) => {
 };
 
 window.addEventListener("message", (e) => {
+  // `source` is a namespace, not a boundary — any frame can put that string in
+  // a message. The boundary is the origin and the sending window. Without this
+  // check, any page holding a handle to the ComfyUI window could post an
+  // "apply" while the overlay was open and overwrite the node's result widget,
+  // which is what feeds the downstream sockets. platform.ts has always done
+  // this on its side; this half did not.
+  if (e.origin !== window.location.origin) return;
+  if (e.source !== overlay?.frame?.contentWindow) return;
   const d = e.data;
   if (!d || d.source !== "h3-prompt-maker") return;
   const node = overlayNode;
@@ -494,7 +502,9 @@ const openSettings = async (node) => {
     inputs.api_key.placeholder = isGemini
       ? "GEMINI_API_KEY 환경변수 또는 aistudio.google.com/apikey 키"
       : "";
-    setUnverified("백엔드가 바뀌었습니다 — 연결을 다시 확인하세요.");
+    // Only when the user actually picked a different backend (fillPreset is
+    // true only from the onchange handler) — not when the dialog merely opens.
+    if (fillPreset) setUnverified("백엔드가 바뀌었습니다 — 연결을 다시 확인하세요.");
   };
 
   let verified = Boolean(cfg.verifiedAt);

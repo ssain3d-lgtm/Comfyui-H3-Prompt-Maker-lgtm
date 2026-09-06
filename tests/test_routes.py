@@ -43,6 +43,25 @@ def ok(name, cond, detail=""):
         failures.append(f"{name}{chr(10) + '      ' + detail if detail else ''}")
 
 
+# --- cross-site guard -------------------------------------------------------
+# ComfyUI has no auth of its own and these POSTs have real side effects: they
+# load and unload the user's model, and an environment API key goes out on the
+# generate route. A page the user happens to have open must not be able to
+# drive them. Only a browser attaches Origin, so its absence means a tool.
+class _Req:
+    def __init__(self, **h): self.headers = h
+
+for _name, _req, _want in [
+    ("no Origin at all — curl, or the node itself", _Req(), False),
+    ("the overlay, same origin", _Req(Origin="http://127.0.0.1:8188", Host="127.0.0.1:8188"), False),
+    ("Sec-Fetch-Site: same-origin", _Req(**{"Sec-Fetch-Site": "same-origin"}), False),
+    ("another site entirely", _Req(Origin="https://evil.example", Host="127.0.0.1:8188"), True),
+    ("Sec-Fetch-Site: cross-site", _Req(**{"Sec-Fetch-Site": "cross-site"}), True),
+    ("a different port on the same host", _Req(Origin="http://127.0.0.1:9999", Host="127.0.0.1:8188"), True),
+    ("Origin: null — a file:// page or a sandboxed frame", _Req(Origin="null", Host="127.0.0.1:8188"), True),
+]:
+    eq(f"cross-site: {_name}", R._cross_site(_req), _want)
+
 # --- asset path guard -------------------------------------------------------
 ok("asset: the committed bundle's index.html is present", (R.APP_DIR / "index.html").is_file())
 ok("asset: index.html resolves", R._safe_asset("index.html") is not None)

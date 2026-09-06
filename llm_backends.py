@@ -358,6 +358,11 @@ def _retry_chat_payload(payload, message, gemini, controlled_text):
         del payload["max_tokens"]
         return True
 
+    # Shed the whole optional group at once — splitting it costs an extra round
+    # trip on every generation against a strict server. ttl and keep_alive ARE
+    # the unload instruction, so losing them here used to mean the generation
+    # succeeded while the model silently stayed in VRAM; _unload_after_call now
+    # notices they are gone and issues the unload explicitly instead.
     optional = [k for k in ("stream_options", "chat_template_kwargs", "ttl", "keep_alive",
                             "reasoning_effort", "extra_body") if k in payload]
     optional_rejected = ("400" in msg or "template" in msg or "extra" in msg
@@ -414,11 +419,37 @@ def call_openai_compatible(base_url, model, api_key, system_prompt, user_text,
     # loaded manually or with `lms load` can therefore ignore ttl entirely.
     # v0.4's native endpoint unloads the actual loaded instance regardless of
     # how it entered memory, which is what "즉시 언로드" promises.
-    if normalize_backend(backend_name) == "lmstudio" and unload_after == "now":
-        result = _unload_lmstudio_model(base_url, api_key, model, min(timeout, 15.0))
-        if not result["ok"]:
-            print(f"H3 Prompt Maker: LM Studio unload warning: {result['detail']}", file=sys.stderr)
+    _unload_after_call(backend_name, base_url, api_key, model, unload_after, payload, timeout)
     return answer
+
+
+def _unload_after_call(backend_name, base_url, api_key, model, unload_after, payload, timeout):
+    """Make "생성 후" mean what it says, even when the retry ladder intervened."""
+    backend = normalize_backend(backend_name)
+    # If the ladder had to shed the keep-alive field to get the request
+    # accepted, the server never received the unload instruction at all.
+    wanted = unload_payload(unload_after, backend)
+    shed = bool(wanted) and any(key not in payload for key in wanted)
+    if unload_after != "now":
+        if shed:
+            print(f"H3 Prompt Maker: {backend} rejected the keep-alive field, so "
+                  f"'{unload_after}' was not applied — the model stays resident.",
+                  file=sys.stderr)
+        return
+    if backend == "lmstudio":
+        # LM Studio documents ttl as applying to JIT-loaded instances. A model
+        # loaded manually or with `lms load` can therefore ignore ttl entirely.
+        # v0.4's native endpoint unloads the actual loaded instance regardless
+        # of how it entered memory, which is what "즉시 언로드" promises.
+        result = _unload_lmstudio_model(base_url, api_key, model, min(timeout, 15.0))
+    elif shed:
+        # Ollama has no post-generation native unload to fall back on: the
+        # keep_alive on the request was the whole mechanism.
+        result = unload_model(backend_name, base_url, api_key, model, min(timeout, 15.0))
+    else:
+        return
+    if not result["ok"]:
+        print(f"H3 Prompt Maker: unload warning: {result['detail']}", file=sys.stderr)
 
 
 def _metric_number(mapping, *names):
@@ -615,10 +646,7 @@ def call_openai_compatible_stream(base_url, model, api_key, system_prompt, user_
                 except Exception:
                     pass
 
-    if normalize_backend(backend_name) == "lmstudio" and unload_after == "now":
-        result = _unload_lmstudio_model(base_url, api_key, model, min(timeout, 15.0))
-        if not result["ok"]:
-            print(f"H3 Prompt Maker: LM Studio unload warning: {result['detail']}", file=sys.stderr)
+    _unload_after_call(backend_name, base_url, api_key, model, unload_after, payload, timeout)
     return answer, metrics
 
 
