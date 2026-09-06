@@ -44,8 +44,8 @@ def ok(name, cond, detail=""):
 
 
 # --- asset path guard -------------------------------------------------------
-ok("asset: index.html resolves", R._safe_asset("index.html") is not None
-   or not (R.APP_DIR / "index.html").is_file())
+ok("asset: the committed bundle's index.html is present", (R.APP_DIR / "index.html").is_file())
+ok("asset: index.html resolves", R._safe_asset("index.html") is not None)
 ok("asset: traversal with ../ is refused", R._safe_asset("../../nodes.py") is None)
 ok("asset: absolute path is refused", R._safe_asset("/etc/passwd") is None)
 ok("asset: encoded traversal is refused", R._safe_asset("assets/../../../nodes.py") is None)
@@ -132,8 +132,23 @@ ok("sheet: no sheet block when no clip was attached",
 eq("sheet: one clip gets one tag, not a range from 1 to 1",
    "<Video 1> ... <Video 1>" in sheet_text, False)
 ok("sheet: one clip is still tagged", "<Video 1>" in sheet_text)
-ok("sheet: three clips get a range",
-   "<Video 1> ... <Video 3>" in R._build_user_text(body, 2, 3))
+# Each clip is now named on its own so its role note can sit beside it. A
+# range could not carry per-clip roles, and one clip never becomes "1 ... 1".
+ok("sheet: three clips are each named",
+   "<Video 1>, <Video 2>, <Video 3>" in R._build_user_text(body, 2, 3))
+
+# Every per-asset role note the overlay collects has to reach the model. Only
+# imageRoles was ever read here, so in ComfyUI the clip and audio notes the
+# user typed were dropped while the same notes worked in the standalone app.
+roled = R._build_user_text(dict(body, videoRoles=["카메라 무빙만", "리듬"],
+                                audioRoles=["목소리 톤"]), 2, 2, 1)
+ok("roles: a clip's note travels with its tag", "<Video 1> — 카메라 무빙만" in roled)
+ok("roles: the second clip keeps its own note", "<Video 2> — 리듬" in roled)
+ok("roles: an audio note travels too", "<Audio 1> — 목소리 톤" in roled)
+ok("roles: a clip with no note is still tagged",
+   "<Video 2>" in R._build_user_text(dict(body, videoRoles=["첫 클립만"]), 2, 2))
+ok("roles: a role list longer than the assets does not leak extra tags",
+   "<Audio 2>" not in R._build_user_text(dict(body, audioRoles=["a", "b", "c"]), 2, 0, 1))
 
 ok("sheet: pictures are still described alongside",
    "<Picture 1> — 얼굴 기준" in sheet_text)

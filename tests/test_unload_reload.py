@@ -89,9 +89,9 @@ class Server(BaseHTTPRequestHandler):
         self.wfile.write(b)
 
 
-srv = HTTPServer(("127.0.0.1", 3404), Server)
+srv = HTTPServer(("127.0.0.1", 0), Server)
 threading.Thread(target=srv.serve_forever, daemon=True).start()
-URL = "http://127.0.0.1:3404/v1"
+URL = f"http://127.0.0.1:{srv.server_port}/v1"
 
 passed, fails = 0, []
 

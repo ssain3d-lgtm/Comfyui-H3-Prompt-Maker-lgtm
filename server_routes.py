@@ -89,18 +89,32 @@ def _build_user_text(body, image_count, sheet_count=0, audio_count=0):
         lines.append(f"Speaker voice: {voice}. Express it inside the speaker's <Subject N> "
                      f"definition, never as a standalone instruction.")
 
-    roles = body.get("imageRoles")
+    def _labelled(kind, count, key):
+        """`<Kind 1> — role, <Kind 2>` for however many actually travelled.
+
+        The overlay collects a per-asset role note for pictures, clips AND audio
+        (InputSection), and App.tsx goes to real trouble to keep the video list
+        aligned with the clips that survive the size filter. Only imageRoles was
+        ever read here, so in ComfyUI every clip and audio note the user typed
+        was dropped before the model saw it — while the same note worked in the
+        standalone web app.
+        """
+        supplied = body.get(key)
+        out = []
+        for i in range(count):
+            role = (supplied[i].strip()
+                    if isinstance(supplied, list) and i < len(supplied)
+                    and isinstance(supplied[i], str) else "")
+            out.append(f"<{kind} {i + 1}>" + (f" — {role}" if role else ""))
+        return ", ".join(out)
+
     if image_count:
-        described = []
-        for i in range(image_count):
-            role = roles[i].strip() if isinstance(roles, list) and i < len(roles) and isinstance(roles[i], str) else ""
-            described.append(f"<Picture {i + 1}>" + (f" — {role}" if role else ""))
-        lines.append("Reference pictures supplied: " + ", ".join(described))
+        lines.append("Reference pictures supplied: " + _labelled("Picture", image_count, "imageRoles"))
 
     if sheet_count:
         n = int(body.get("videoFrameCount") or 8)
         # "<Video 1> ... <Video 1>" reads like two clips. One clip gets one tag.
-        tags = "<Video 1>" if sheet_count == 1 else f"<Video 1> ... <Video {sheet_count}>"
+        tags = _labelled("Video", sheet_count, "videoRoles")
         lines.append(
             f"Attached after the reference pictures are {sheet_count} contact sheet(s), one per "
             f"reference clip: {tags}, in that order. Each sheet tiles "
@@ -113,7 +127,8 @@ def _build_user_text(body, image_count, sheet_count=0, audio_count=0):
 
     if audio_count:
         lines.append(
-            f"{audio_count} reference audio clip(s) are attached: <Audio 1> ... <Audio {audio_count}>. "
+            f"{audio_count} reference audio clip(s) are attached: "
+            f"{_labelled('Audio', audio_count, 'audioRoles')}. "
             f"If you can hear them, let what you hear drive overall_soundscape and non_diegetic_music, "
             f"and give each one a documented marker (fully_copy | partially_copy | reference | "
             f"weak_reference) in retention_analysis. If you cannot hear audio at all, say nothing "

@@ -23,6 +23,9 @@ L = importlib.import_module("h3m.llm_backends")
 
 seen = []
 REJECT = {"audio": False, "vision": False}
+# "empty" = a 200 whose answer is unusable (safety filter, or a shape we
+# cannot read). The request was accepted; only the answer is bad.
+ANSWER = {"mode": "ok"}
 
 
 class H(BaseHTTPRequestHandler):
@@ -35,7 +38,14 @@ class H(BaseHTTPRequestHandler):
         kinds = {p.get("type") for p in parts} if isinstance(parts, list) else set()
         bad = ((REJECT["audio"] and "input_audio" in kinds)
                or (REJECT["vision"] and "image_url" in kinds))
-        if bad:
+        if ANSWER["mode"] == "filtered":
+            b = json.dumps({"choices": [{"message": {"content": ""},
+                                         "finish_reason": "content_filter"}]}).encode()
+            self.send_response(200)
+        elif ANSWER["mode"] == "malformed":
+            b = json.dumps({"result": {"content": "not the shape we read"}}).encode()
+            self.send_response(200)
+        elif bad:
             b = json.dumps({"error": {"message": "400: this model does not support that content type"}}).encode()
             self.send_response(400)
         else:
@@ -48,8 +58,9 @@ class H(BaseHTTPRequestHandler):
         self.wfile.write(b)
 
 
-srv = HTTPServer(("127.0.0.1", 3402), H)
+srv = HTTPServer(("127.0.0.1", 0), H)
 threading.Thread(target=srv.serve_forever, daemon=True).start()
+URL = f"http://127.0.0.1:{srv.server_port}/v1"
 
 passed, fails = 0, []
 
@@ -76,7 +87,7 @@ M4A = base64.b64encode(b"\x00\x00\x00\x20ftypM4A \x00\x00\x00\x00").decode()
 
 def call(images=None, audios=None, thinking="auto", unload="keep", backend="openai_compat"):
     seen.clear()
-    return L.call_llm(backend, "http://127.0.0.1:3402/v1", "m", "", "", "sys", "장면 요청",
+    return L.call_llm(backend, URL, "m", "", "", "sys", "장면 요청",
                       images_base64=images, audios_base64=audios, max_tokens=60000,
                       thinking=thinking, unload_after=unload)
 
@@ -154,6 +165,28 @@ REJECT["audio"] = REJECT["vision"] = True
 call(images=[JPEG], audios=[WAV])
 eq("shed: a text-only model costs two retries, not more", len(seen), 3)
 eq("shed: the last attempt is plain text", seen[2]["messages"][1]["content"], "장면 요청")
+
+# An unusable ANSWER is not a rejected REQUEST. Both messages happen to carry
+# the word "content" — "(finish_reason=content_filter)" and the quoted response
+# body — which the shedding ladder read as "this model cannot take image or
+# audio parts". It then re-sent without the audio, then without every reference
+# picture, and handed back the text-only answer as a success, with nothing
+# saying the references had been dropped.
+REJECT["audio"] = REJECT["vision"] = False
+for mode, label in (("filtered", "안전 필터"), ("malformed", "읽을 수 없는 응답")):
+    ANSWER["mode"] = mode
+    try:
+        call(images=[JPEG], audios=[WAV])
+        fails.append(f"{label}: the call should have raised")
+    except L.LLMAnswerError:
+        passed += 1
+    except Exception as exc:  # noqa: BLE001
+        fails.append(f"{label}: raised {type(exc).__name__}, not LLMAnswerError")
+    eq(f"{label}: the request is sent once, never re-sent without the media", len(seen), 1)
+    if seen:
+        eq(f"{label}: the reference picture and audio were never dropped",
+           [x["type"] for x in parts(seen[0])], ["text", "image_url", "input_audio"])
+ANSWER["mode"] = "ok"
 
 # Nothing to shed means nothing to retry — a dead server must not be hit twice.
 REJECT["audio"], REJECT["vision"] = False, True

@@ -14,14 +14,49 @@ in place — which is what this script is for. Run it after any web app change,
 then commit whatever it produced.
 """
 
+import hashlib
+import json
 import shutil
 import subprocess
 import sys
 import pathlib
+import datetime
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 # Only what a browser is served. Anything else in dist-comfy is a build leftover.
 KEEP_SUFFIXES = {".html", ".js", ".css", ".map", ".svg", ".png", ".ico", ".woff2", ".json"}
+
+
+def git(src: pathlib.Path, *args: str) -> str:
+    """A git field from the web app checkout, or "" when it is not a repo."""
+    try:
+        out = subprocess.run(["git", "-C", str(src), *args],
+                             capture_output=True, text=True, check=True)
+        return out.stdout.strip()
+    except Exception:  # noqa: BLE001 — provenance is best-effort, never fatal
+        return ""
+
+
+def write_provenance(src: pathlib.Path, dist: pathlib.Path) -> None:
+    """Stamp SYNC_SOURCE.json with the web app revision these artifacts came from."""
+    prompts = src / "prompts.ts"
+    bundle = sorted(p.name for p in (dist / "assets").glob("*.js"))
+    stamp = {
+        "webapp_commit": git(src, "rev-parse", "HEAD"),
+        "webapp_subject": git(src, "log", "-1", "--format=%s"),
+        # A sync from a checkout with uncommitted edits produces a bundle whose
+        # source is not in any repository. That is worth saying out loud.
+        "webapp_dirty": bool(git(src, "status", "--porcelain")),
+        "prompts_sha256": (hashlib.sha256(prompts.read_bytes()).hexdigest()
+                           if prompts.is_file() else ""),
+        "bundle_js": bundle,
+        "generated_at": datetime.datetime.now(datetime.timezone.utc)
+                                 .replace(microsecond=0).isoformat(),
+    }
+    (ROOT / "SYNC_SOURCE.json").write_text(
+        json.dumps(stamp, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    where = stamp["webapp_commit"][:8] or "(git 아님)"
+    print(f"   출처 기록: {where}" + (" — 커밋되지 않은 변경 포함!" if stamp["webapp_dirty"] else ""))
 
 
 def main(webapp: str) -> int:
@@ -56,6 +91,12 @@ def main(webapp: str) -> int:
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(path, target)
         copied += 1
+
+    # Record where these two generated artifacts came from. Nothing in this
+    # repository can see the web app, so without a stamp a bundle that is three
+    # commits behind looks exactly like a fresh one — which is how the overlay
+    # silently shipped stale. check_bundle.py reads this back and prints it.
+    write_provenance(src, dist)
 
     html = index.read_text(encoding="utf-8")
     # The build script already checks this, but the copy is what actually ships.

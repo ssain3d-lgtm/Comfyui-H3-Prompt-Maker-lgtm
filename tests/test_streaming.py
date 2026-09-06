@@ -68,12 +68,13 @@ class Handler(BaseHTTPRequestHandler):
             pass
 
 
-server = ThreadingHTTPServer(("127.0.0.1", 3410), Handler)
+server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
 threading.Thread(target=server.serve_forever, daemon=True).start()
+URL = f"http://127.0.0.1:{server.server_port}/v1"
 
 chunks = []
 text, metrics = L.stream_llm(
-    "openai_compat", "http://127.0.0.1:3410/v1", "model", "", "",
+    "openai_compat", URL, "model", "", "",
     "system", "scene", on_delta=chunks.append)
 
 checks = {
@@ -91,7 +92,7 @@ cancel = L.StreamCancel()
 cancelled = False
 try:
     L.stream_llm(
-        "openai_compat", "http://127.0.0.1:3410/v1", "model", "", "",
+        "openai_compat", URL, "model", "", "",
         "system", "scene", on_delta=lambda _chunk: cancel.cancel(), cancel=cancel)
 except L.LLMCancelled:
     cancelled = True
@@ -101,7 +102,7 @@ checks["cancellation closes an active upstream stream"] = cancelled
 # image part; a bare HTTP 400 used to trigger the unrelated media-shedding path.
 legacy_chunks = []
 legacy_text, legacy_metrics = L.stream_llm(
-    "openai_compat", "http://127.0.0.1:3410/v1", "legacy", "", "",
+    "openai_compat", URL, "legacy", "", "",
     "system", "scene", images_base64=["QUJD"], on_delta=legacy_chunks.append)
 legacy_requests = [body for body in seen if body.get("model") == "legacy"]
 legacy_parts = legacy_requests[-1]["messages"][1]["content"]

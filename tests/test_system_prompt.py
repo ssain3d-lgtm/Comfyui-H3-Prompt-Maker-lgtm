@@ -33,7 +33,7 @@ class H(BaseHTTPRequestHandler):
         self.send_response(200); self.send_header("Content-Type","application/json")
         self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
 
-srv = HTTPServer(("127.0.0.1", 3399), H)
+srv = HTTPServer(("127.0.0.1", 0), H)
 threading.Thread(target=srv.serve_forever, daemon=True).start()
 
 # Exactly what the overlay posts to /api/generate-prompt, run through the same
@@ -42,7 +42,7 @@ body = {
     "minimaxStyle": "ref2va", "duration": 10, "isNSFW": False,
     "promptText": "골목을 걷는 인물", "voiceDirection": "낮고 허스키한 목소리",
     "customSystemPrompt": "모든 장면에 비를 추가할 것",
-    "llm": {"backend": "openai_compat", "base_url": "http://127.0.0.1:3399/v1", "model": "fake-model"},
+    "llm": {"backend": "openai_compat", "base_url": f"http://127.0.0.1:{srv.server_port}/v1", "model": "fake-model"},
 }
 sysprompt = P.build_system_prompt(
     "ref2va", 10.0, False, camera_instruction="", custom_directives=body["customSystemPrompt"])
@@ -82,9 +82,17 @@ for name, ok in checks:
 # h3_prompts.py from prompts.ts, and the committed file must come back byte for
 # byte or the two frontends are sending different instructions.
 import os, subprocess
-webapp = os.environ.get("H3_WEBAPP", "/home/user/minimax-h3-prompt-maker-google-studio-ai-v3")
+# No machine-specific default: the old one pointed at one developer's home
+# directory, so everywhere else — CI included — this check quietly did nothing.
+# Look beside the pack, then accept an explicit override.
+_default = PACK.parent / "minimax-h3-prompt-maker-google-studio-ai-v3"
+webapp = os.environ.get("H3_WEBAPP") or str(_default)
 prompts_ts = pathlib.Path(webapp) / "prompts.ts"
 print()
+if os.environ.get("H3_WEBAPP") and not prompts_ts.is_file():
+    # An explicit override that does not resolve is a typo, not an absence.
+    print(f"  ✗ H3_WEBAPP 이 가리키는 곳에 prompts.ts 가 없습니다: {prompts_ts}")
+    sys.exit(1)
 if prompts_ts.is_file():
     # Regenerate to a temp file, not over the committed one. Running the suite
     # used to leave a dirty tree — and if the local webapp checkout happened to
@@ -100,6 +108,24 @@ if prompts_ts.is_file():
     same = before == after
     print(("  ✓ " if same else "  ✗ ") + f"웹앱 prompts.ts에서 재생성 시 바이트 동일 ({len(after):,} bytes)")
     bad += not same
+    # The stamp check_bundle.py reports is only worth reading if it is true.
+    stamp_file = PACK / "SYNC_SOURCE.json"
+    if stamp_file.is_file():
+        import hashlib, json as _json
+        recorded = _json.loads(stamp_file.read_text(encoding="utf-8")).get("prompts_sha256")
+        actual = hashlib.sha256(prompts_ts.read_bytes()).hexdigest()
+        if recorded:
+            match = recorded == actual
+            print(("  ✓ " if match else "  ✗ ")
+                  + "SYNC_SOURCE.json 이 기록한 prompts.ts 해시가 현재 웹앱과 일치")
+            if not match:
+                print(f"      기록 {recorded[:12]}… / 실제 {actual[:12]}… "
+                      "— 번들이 최신 웹앱보다 뒤처져 있습니다. tools/sync_app.py 를 실행하세요.")
+            bad += not match
 else:
-    print(f"  – 동기화 검사 건너뜀 (웹앱 체크아웃 없음: {prompts_ts})")
+    # Loud, not a quiet dash: this is the only check that catches the two
+    # frontends drifting apart, and for years it silently did not run.
+    print(f"  ⚠️  동기화 검사를 실행하지 못했습니다 — 웹앱 체크아웃 없음: {prompts_ts}")
+    print("      H3_WEBAPP=/path/to/webapp 로 지정하면 prompts.ts 대조까지 수행합니다.")
+    print("      (CI에는 웹앱 체크아웃이 없으므로 tools/check_bundle.py 가 기록된 출처를 대신 확인합니다.)")
 sys.exit(1 if bad else 0)

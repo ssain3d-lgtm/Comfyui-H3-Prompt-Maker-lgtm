@@ -8,6 +8,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+      # tests/test_node_face.mjs ran on whatever node the runner image shipped,
+      # which is not a version anyone chose.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
       # ComfyUI itself runs on aiohttp, so the route tests that stand the real
       # handlers up need it. Everything else here is stdlib only.
       - run: python3 -m pip install --disable-pip-version-check aiohttp

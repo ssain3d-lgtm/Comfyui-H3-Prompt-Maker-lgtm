@@ -43,7 +43,15 @@ class LLM(BaseHTTPRequestHandler):
         b = json.dumps({"choices":[{"message":{"content":"subject_definitions: a\nsummary: b\ndetailed_description: c"}}]}).encode()
         self.send_response(200); self.send_header("Content-Type","application/json")
         self.send_header("Content-Length",str(len(b))); self.end_headers(); self.wfile.write(b)
-threading.Thread(target=HTTPServer(("127.0.0.1",3406),LLM).serve_forever, daemon=True).start()
+llm_srv = HTTPServer(("127.0.0.1", 0), LLM)
+threading.Thread(target=llm_srv.serve_forever, daemon=True).start()
+LLM_URL = f"http://127.0.0.1:{llm_srv.server_port}/v1"
+# The aiohttp app gets an ephemeral port too, so a second run of this suite
+# (another contributor, another CI job) does not collide on a fixed one.
+import socket
+app_sock = socket.socket(); app_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+app_sock.bind(("127.0.0.1", 0)); app_sock.listen(128)
+APP_URL = f"http://127.0.0.1:{app_sock.getsockname()[1]}/h3_prompt_maker/api"
 
 worst = {"tick": 0.0, "health": 0.0}
 async def heartbeat():
@@ -57,15 +65,25 @@ app.on_startup.append(on_start)
 routes = web.RouteTableDef(); R.register(routes); app.add_routes(routes)
 
 def hammer():
+    try:
+        _hammer()
+    except Exception:
+        import os, traceback
+        traceback.print_exc()
+        print("\n✗ 하네스 자체가 실패했습니다 — 위 트레이스백을 보세요.")
+        os._exit(1)
+
+
+def _hammer():
     time.sleep(1.0)
     body = json.dumps({"promptText":"x","llm":{"backend":"openai_compat",
-        "base_url":"http://127.0.0.1:3406/v1","model":"m","unload_after":"keep"}}).encode()
+        "base_url":LLM_URL,"model":"m","unload_after":"keep"}}).encode()
     threading.Thread(target=lambda: urllib.request.urlopen(
-        urllib.request.Request("http://127.0.0.1:8813/h3_prompt_maker/api/generate-prompt",
+        urllib.request.Request(APP_URL + "/generate-prompt",
         data=body, headers={"Content-Type":"application/json"}), timeout=60).read(), daemon=True).start()
     time.sleep(0.7)
     t = time.monotonic()
-    urllib.request.urlopen("http://127.0.0.1:8813/h3_prompt_maker/api/health", timeout=60).read()
+    urllib.request.urlopen(APP_URL + "/health", timeout=60).read()
     worst["health"] = time.monotonic()-t
     time.sleep(SLOW+1.0)
     import os
@@ -86,4 +104,4 @@ def hammer():
     os._exit(0)
 
 threading.Thread(target=hammer, daemon=True).start()
-web.run_app(app, host="127.0.0.1", port=8813, print=None)
+web.run_app(app, sock=app_sock, print=None)

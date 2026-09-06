@@ -35,6 +35,20 @@ class LLMCancelled(LLMError):
     """The caller stopped an in-flight streamed completion."""
 
 
+class LLMAnswerError(LLMError):
+    """The request was accepted; the *answer* is unusable.
+
+    Kept apart from a plain LLMError because the capability-shedding retry below
+    reads the error text to guess which part of the request a server refused.
+    An empty answer says "(finish_reason=content_filter)" and a malformed one
+    quotes the response — both contain the word "content", which the ladder read
+    as "this model cannot take image/audio parts". It then re-sent the request
+    without the audio, then without every reference picture, and returned the
+    text-only answer as a success. The user was never told their references had
+    been dropped.
+    """
+
+
 class StreamCancel:
     """Cross-thread cancellation that also closes a blocking urllib response.
 
@@ -221,7 +235,7 @@ def _extract_text(data):
         message = data["choices"][0]["message"]
         text = message.get("content")
     except (KeyError, IndexError, TypeError, AttributeError):
-        raise LLMError(f"Unexpected LLM response shape: {str(data)[:500]}")
+        raise LLMAnswerError(f"Unexpected LLM response shape: {str(data)[:500]}")
 
     # LM Studio and others hand a reasoning model's thinking back in its own
     # field instead of inline. When the model spent that field on the actual
@@ -231,8 +245,8 @@ def _extract_text(data):
     if reasoning and isinstance(reasoning, str) and reasoning.strip():
         text = f"<think>{reasoning}</think>\n{text or ''}"
     if not text or not text.strip():
-        raise LLMError(_empty_answer_message("LLM returned an empty response.",
-                                             data["choices"][0].get("finish_reason")))
+        raise LLMAnswerError(_empty_answer_message(
+            "LLM returned an empty response.", data["choices"][0].get("finish_reason")))
     return text
 
 
@@ -389,6 +403,8 @@ def call_openai_compatible(base_url, model, api_key, system_prompt, user_text,
         try:
             answer = _extract_text(post())
             break
+        except LLMAnswerError:
+            raise
         except LLMError as exc:
             if _retry_chat_payload(payload, str(exc), gemini, controlled_text):
                 continue
@@ -522,8 +538,8 @@ def _read_openai_stream(response, on_delta, cancel, started):
         reasoning = "".join(reasoning_chunks)
         answer = (f"<think>{reasoning}</think>\n{content}" if reasoning else content)
         if not answer.strip():
-            raise LLMError(_empty_answer_message("LLM returned an empty streaming response.",
-                                                 finish_reason))
+            raise LLMAnswerError(_empty_answer_message(
+                "LLM returned an empty streaming response.", finish_reason))
 
     return answer, _stream_metrics(started, first_token_at, usage, stats, answer)
 
@@ -550,7 +566,7 @@ def call_openai_compatible_stream(base_url, model, api_key, system_prompt, user_
                 cancel.attach(response)
             answer, metrics = _read_openai_stream(response, on_delta, cancel, started)
             break
-        except LLMCancelled:
+        except (LLMCancelled, LLMAnswerError):
             raise
         except LLMError as exc:
             msg = str(exc).lower()

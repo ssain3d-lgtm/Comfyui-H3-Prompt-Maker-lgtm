@@ -1,0 +1,10 @@
+{
+  "webapp_commit": "e740e78d536d7ccda1de17a7047e7ae325a29d37",
+  "webapp_subject": "fix: the picture edit button is visible without hovering",
+  "webapp_dirty": false,
+  "prompts_sha256": "02518221078ba7e00e236f6f1dd2164647e447942100f0fdb132b59408677789",
+  "bundle_js": [
+    "index-Dd7ngieh.js"
+  ],
+  "generated_at": "2026-09-06T10:21:50+00:00"
+}

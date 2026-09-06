@@ -25,8 +25,9 @@ class H(BaseHTTPRequestHandler):
         self.send_header("Content-Type","application/json"); self.send_header("Content-Length",str(len(b)))
         self.end_headers(); self.wfile.write(b)
 
-srv = HTTPServer(("127.0.0.1", 3401), H)
+srv = HTTPServer(("127.0.0.1", 0), H)
 threading.Thread(target=srv.serve_forever, daemon=True).start()
+URL = f"http://127.0.0.1:{srv.server_port}/v1"
 
 passed, fails = 0, []
 def ok(n, c, d=""):
@@ -36,7 +37,7 @@ def ok(n, c, d=""):
 
 def call(mode, unload="keep", backend="openai_compat"):
     seen.clear()
-    L.call_llm(backend, "http://127.0.0.1:3401/v1", "m", "", "", "sys", "장면 요청",
+    L.call_llm(backend, URL, "m", "", "", "sys", "장면 요청",
                thinking=mode, max_tokens=60000, unload_after=unload)
     return seen
 
