@@ -250,6 +250,69 @@ async def _warm_for_generation(cfg):
     }
 
 
+def prepare_generation(body):
+    """Turn one overlay-shaped request body into everything a generation needs.
+
+    Shared by the HTTP route the overlay calls and by the UI-Instant node,
+    which rebuilds the same body from the form the overlay saved into the
+    node — so both paths ask the model for exactly the same thing.
+
+    Returns a dict: cfg, system_prompt, user_text, send_images, audios, seconds.
+    """
+    submode = str(body.get("minimaxStyle") or "ref2va")
+    try:
+        seconds = float(body.get("duration") or 10)
+    except (TypeError, ValueError):
+        seconds = 10.0
+    seconds = max(1.0, min(60.0, seconds))
+    is_nsfw = bool(body.get("isNSFW"))
+
+    camera = " ".join(x for x in (str(body.get("cameraPosition") or "").strip(),
+                                  str(body.get("cameraAngle") or "").strip()) if x)
+    remake = None
+    if body.get("isRemake"):
+        axes = body.get("remakeAxes")
+        remake = {
+            "axes": [a for a in axes if isinstance(a, str)] if isinstance(axes, list) else [],
+            "strength": str(body.get("remakeStrength") or "medium"),
+            "source_type": "custom" if body.get("remakeSourceType") == "custom" else "h3",
+        }
+
+    cfg = _llm_settings(body)
+    system_prompt = build_system_prompt(
+        submode, seconds, is_nsfw,
+        camera_instruction=camera,
+        custom_directives=str(body.get("customSystemPrompt") or ""),
+        remake=remake,
+        prompt_profile=cfg["prompt_profile"],
+    )
+
+    images = [_strip_data_url(x) for x in _collect(body, "imageBase64", "imagesBase64")]
+    images = [x for x in images if x][:9]
+    # The OpenAI-compatible chat schema every local backend speaks has no
+    # video part, so a clip arrives as one contact sheet of its frames and
+    # rides along as an ordinary image. Sheets go after the pictures and
+    # keep their own cap, so a third clip can never push out <Picture 9>.
+    sheets = [_strip_data_url(x) for x in _collect(body, "videoFramesBase64")]
+    sheets = [x for x in sheets if x][:3]
+    # Audio only lands anywhere on an omni model (Qwen2-Audio, Qwen2.5/3-Omni).
+    # Sending it regardless is right: the call sheds it on rejection, so a
+    # text model behaves exactly as before while an omni model gains the clip.
+    audios = [_strip_data_url(x) for x in _collect(body, "audioBase64", "audiosBase64")]
+    audios = [x for x in audios if x][:3]
+    user_text = _build_user_text(body, len(images), len(sheets), len(audios))
+    is_cli = cfg["backend"].endswith("_cli")
+    # A CLI backend takes stdin only, so pictures cannot travel with it.
+    return {
+        "cfg": cfg,
+        "system_prompt": system_prompt,
+        "user_text": user_text,
+        "send_images": (images + sheets) if not is_cli else [],
+        "audios": audios if not is_cli else None,
+        "seconds": seconds,
+    }
+
+
 def _accepts_stream(request):
     headers = getattr(request, "headers", {})
     return "application/x-ndjson" in str(headers.get("Accept", "")).lower()
@@ -484,55 +547,14 @@ def register(routes):
         except Exception as exc:
             return _json({"error": f"잘못된 요청입니다: {exc}"}, status=400)
 
-        submode = str(body.get("minimaxStyle") or "ref2va")
-        try:
-            seconds = float(body.get("duration") or 10)
-        except (TypeError, ValueError):
-            seconds = 10.0
-        seconds = max(1.0, min(60.0, seconds))
-        is_nsfw = bool(body.get("isNSFW"))
-
-        camera = " ".join(x for x in (str(body.get("cameraPosition") or "").strip(),
-                                      str(body.get("cameraAngle") or "").strip()) if x)
-        remake = None
-        if body.get("isRemake"):
-            axes = body.get("remakeAxes")
-            remake = {
-                "axes": [a for a in axes if isinstance(a, str)] if isinstance(axes, list) else [],
-                "strength": str(body.get("remakeStrength") or "medium"),
-                "source_type": "custom" if body.get("remakeSourceType") == "custom" else "h3",
-            }
-
-        cfg = _llm_settings(body)
-        system_prompt = build_system_prompt(
-            submode, seconds, is_nsfw,
-            camera_instruction=camera,
-            custom_directives=str(body.get("customSystemPrompt") or ""),
-            remake=remake,
-            prompt_profile=cfg["prompt_profile"],
-        )
-
-        images = [_strip_data_url(x) for x in _collect(body, "imageBase64", "imagesBase64")]
-        images = [x for x in images if x][:9]
-        # The OpenAI-compatible chat schema every local backend speaks has no
-        # video part, so a clip arrives as one contact sheet of its frames and
-        # rides along as an ordinary image. Sheets go after the pictures and
-        # keep their own cap, so a third clip can never push out <Picture 9>.
-        sheets = [_strip_data_url(x) for x in _collect(body, "videoFramesBase64")]
-        sheets = [x for x in sheets if x][:3]
-        # Audio only lands anywhere on an omni model (Qwen2-Audio, Qwen2.5/3-Omni).
-        # Sending it regardless is right: the call sheds it on rejection, so a
-        # text model behaves exactly as before while an omni model gains the clip.
-        audios = [_strip_data_url(x) for x in _collect(body, "audioBase64", "audiosBase64")]
-        audios = [x for x in audios if x][:3]
-        user_text = _build_user_text(body, len(images), len(sheets), len(audios))
-        # A CLI backend takes stdin only, so pictures cannot travel with it.
-        send_images = (images + sheets) if not cfg["backend"].endswith("_cli") else []
+        prep = prepare_generation(body)
+        cfg, seconds = prep["cfg"], prep["seconds"]
+        system_prompt, user_text = prep["system_prompt"], prep["user_text"]
+        send_images, audios = prep["send_images"], prep["audios"]
 
         if _accepts_stream(request):
             return await _stream_generation(
-                request, cfg, system_prompt, user_text, send_images,
-                audios if not cfg["backend"].endswith("_cli") else None, seconds)
+                request, cfg, system_prompt, user_text, send_images, audios, seconds)
 
         # JSON compatibility path for old overlay bundles and direct callers.
         warm_note, load_metrics = await _warm_for_generation(cfg)
@@ -545,7 +567,7 @@ def register(routes):
                 temperature=cfg["temperature"], server_model=cfg["server_model"],
                 max_tokens=cfg["max_tokens"], thinking=cfg["thinking"],
                 unload_after=cfg["unload_after"],
-                audios_base64=audios if not cfg["backend"].endswith("_cli") else None,
+                audios_base64=audios,
             )
         except LLMError as exc:
             detail = str(exc)

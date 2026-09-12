@@ -12,7 +12,11 @@ import json
 import re
 
 from .h3_prompts import build_system_prompt, nearest_grid_frames
-from .llm_backends import call_llm, AUTO_MODEL, BACKEND_NAMES, discover_local_models
+from .llm_backends import (
+    AUTO_MODEL, BACKEND_NAMES, LLMError, call_llm, discover_local_models, normalize_backend,
+    warm_up_model,
+)
+from .server_routes import _ALWAYS_RESIDENT_BACKENDS, _selected_model, prepare_generation
 
 SUBMODES = ["ref2va", "t2va", "i2va", "fl2va", "l2va"]
 DURATIONS = ["5s (124f)", "6s (158f)", "8s (192f)", "10s (243f)", "12s (294f)", "15s (362f)",
@@ -489,14 +493,149 @@ class H3PromptMakerUI:
         )
 
 
+def _load_json_widget(raw):
+    try:
+        data = json.loads(raw) if str(raw).strip() else {}
+    except (ValueError, TypeError):
+        data = {}
+    return data if isinstance(data, dict) else {}
+
+
+def instant_request_body(form, settings, scene, images_b64):
+    """The overlay's own request shape, rebuilt from what it saved into the node.
+
+    `form` is the `state` widget — the form fields App.tsx persists on every
+    edit (scene, dialogue, voice, duration, SFW/NSFW, submode, camera, custom
+    directives, remake settings, the video/audio notes). Attachments are
+    deliberately not in it (a workflow is copied into every PNG it renders),
+    so the pictures come from the IMAGE socket instead.
+    """
+    remake_source = str(form.get("remakeSourcePrompt") or "")
+    is_remake = bool(form.get("isRemakeMode")) and bool(remake_source.strip())
+    axes = form.get("remakeAxes")
+    return {
+        "promptText": scene,
+        "ltxNarration": str(form.get("ltxNarration") or ""),
+        "voiceDirection": str(form.get("voiceDirection") or ""),
+        "duration": form.get("duration") or 10,
+        "isNSFW": bool(form.get("isNSFW")),
+        "minimaxStyle": str(form.get("minimaxStyle") or "ref2va"),
+        "cameraPosition": str(form.get("cameraPosition") or ""),
+        "cameraAngle": str(form.get("cameraAngle") or ""),
+        "customSystemPrompt": str(form.get("customSystemPrompt") or ""),
+        "isRemake": is_remake,
+        "remakeSourcePrompt": remake_source if is_remake else "",
+        "remakeAxes": [a for a in axes if isinstance(a, str)] if isinstance(axes, list) else [],
+        "remakeStrength": str(form.get("remakeStrength") or "medium"),
+        "remakeSourceType": str(form.get("remakeSourceType") or "h3"),
+        "videoRefNote": str(form.get("videoNote") or ""),
+        "audioRefNote": str(form.get("audioNote") or ""),
+        "imagesBase64": list(images_b64),
+        "llm": settings,
+    }
+
+
+class H3PromptMakerInstant:
+    """The UI node's form and model settings, generated on Queue instead of by hand.
+
+    Same overlay and same ⚙️ dialog as the UI node — the form is written into
+    `state` as the user edits it, the backend into `llm`. The difference is
+    execution: the UI node emits what was applied and never calls the model,
+    this one calls the model every time the graph runs, so it can sit inside a
+    workflow with nothing to click. Pictures come from the IMAGE socket
+    (attachments are never saved into a workflow) and the scene text can be
+    overridden from the scene_request socket.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        hidden_str = lambda: ("STRING", {"default": ""})
+        return {
+            "required": {
+                "state": hidden_str(),
+                "llm": hidden_str(),
+                "result": hidden_str(),
+                # ComfyUI reruns a node only when an input changed, so with
+                # the same form and pictures a second Queue would reuse the
+                # cached prompt. The seed is the knob that asks for a new one.
+                "seed": ("INT", {"default": 0, "min": 0, "max": 0xFFFFFFFF, "control_after_generate": True,
+                    "tooltip": "같은 입력으로 다시 생성하려면 바꾸세요. fixed로 두면 입력이 바뀔 때만 다시 생성합니다."}),
+            },
+            "optional": {
+                "images": ("IMAGE",),
+                "scene_request": ("STRING", {"forceInput": True, "multiline": True,
+                    "tooltip": "연결하면 오버레이에 적어 둔 장면 요청 대신 이 텍스트를 씁니다."}),
+            },
+        }
+
+    @classmethod
+    def VALIDATE_INPUTS(cls, **kwargs):
+        return True
+
+    RETURN_TYPES = ("STRING", "INT", "STRING", "STRING", "INT")
+    RETURN_NAMES = ("prompt", "length_frames", "korean_summary", "all_segments", "segment_count")
+    FUNCTION = "generate"
+    CATEGORY = "H3 Prompt Maker"
+
+    def generate(self, state="", llm="", result="", seed=0, images=None, scene_request=""):
+        form = _load_json_widget(state)
+        settings = _load_json_widget(llm)
+        scene = str(scene_request or "").strip() or str(form.get("prompt") or "").strip()
+        images_b64 = _images_to_base64(images) if images is not None else []
+        remake_ready = bool(form.get("isRemakeMode")) and bool(str(form.get("remakeSourcePrompt") or "").strip())
+        if not scene and not images_b64 and not remake_ready:
+            raise RuntimeError(
+                "H3 Prompt Maker (UI-Instant): 장면 요청이 없습니다. "
+                "'🎬 프롬프트 메이커 열기'에서 장면을 적어 두거나, scene_request 소켓에 텍스트를 연결하거나, "
+                "images 소켓에 참조 사진을 연결하세요."
+            )
+        if not settings:
+            raise RuntimeError(
+                "H3 Prompt Maker (UI-Instant): 모델이 설정되지 않았습니다. "
+                "노드의 '⚙️ 모델 연결'에서 백엔드와 모델을 고르고 저장하세요."
+            )
+
+        prep = prepare_generation(instant_request_body(form, settings, scene, images_b64))
+        cfg = prep["cfg"]
+        # "창 닫을 때 언로드" has no window to close here. The nearest honest
+        # reading in a graph is "unload as soon as the prompt is out": the H3
+        # render that follows in the same queue wants that VRAM back.
+        unload_after = "now" if cfg["unload_after"] == "close" else cfg["unload_after"]
+        backend = normalize_backend(cfg["backend"])
+        if (unload_after != "keep" and not backend.endswith("_cli")
+                and backend not in _ALWAYS_RESIDENT_BACKENDS):
+            # A model this node unloaded on the previous run must come back
+            # before the call, or a JIT-less server answers with a 404.
+            model = _selected_model(cfg)
+            if model:
+                warm_up_model(cfg["backend"], cfg["base_url"], cfg["api_key"], model)
+        try:
+            raw = call_llm(
+                cfg["backend"], cfg["base_url"], cfg["model"], cfg["api_key"], cfg["cli_command"],
+                prep["system_prompt"], prep["user_text"], images_base64=prep["send_images"],
+                temperature=cfg["temperature"], seed=seed, server_model=cfg["server_model"],
+                max_tokens=cfg["max_tokens"], thinking=cfg["thinking"],
+                unload_after=unload_after, audios_base64=prep["audios"],
+            )
+        except LLMError as exc:
+            raise RuntimeError(f"H3 Prompt Maker (UI-Instant): {exc}") from exc
+        if not str(raw or "").strip():
+            raise RuntimeError("H3 Prompt Maker (UI-Instant): 모델이 빈 응답을 반환했습니다. "
+                               "다른 모델을 쓰거나 컨텍스트 길이를 늘려보세요.")
+        prompt, frames, korean, sequence, seg_count = _parse_llm_output(raw, prep["seconds"])
+        return (prompt, frames, korean, sequence, seg_count)
+
+
 NODE_CLASS_MAPPINGS = {
     "H3PromptArchitect": H3PromptArchitect,
     "H3PromptRemake": H3PromptRemake,
     "H3PromptMakerUI": H3PromptMakerUI,
+    "H3PromptMakerInstant": H3PromptMakerInstant,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "H3PromptArchitect": "MiniMax H3 Prompt Architect 🎬",
     "H3PromptRemake": "MiniMax H3 Prompt Remake 🔄",
     "H3PromptMakerUI": "MiniMax H3 Prompt Maker (UI) 🖥️",
+    "H3PromptMakerInstant": "MiniMax H3 Prompt Maker (UI-Instant) ⚡",
 }

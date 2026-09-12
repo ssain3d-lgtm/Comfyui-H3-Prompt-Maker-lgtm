@@ -1,7 +1,7 @@
 /**
- * Draws the H3 Prompt Maker (UI) node and hosts the overlay.
+ * Draws the H3 Prompt Maker (UI) and (UI-Instant) nodes and hosts the overlay.
  *
- * The node's three widgets (state / llm / result) are written by the overlay,
+ * Both nodes carry the same three widgets (state / llm / result), written by the overlay,
  * never typed, so they are hidden and replaced by two buttons. The overlay is
  * the web app's own bundle in an iframe; everything crossing that boundary goes
  * through postMessage with a namespaced `source`, because ComfyUI's frontend
@@ -10,6 +10,10 @@
 import { app } from "../../scripts/app.js";
 
 const NODE = "H3PromptMakerUI";
+// Same overlay and settings dialog; the difference is on the Python side —
+// this one calls the model on Queue from the saved form instead of emitting
+// what was applied. The node face says so instead of "applied prompt".
+const NODE_INSTANT = "H3PromptMakerInstant";
 const PREFIX = "/h3_prompt_maker";
 const HIDDEN = ["state", "llm", "result"];
 
@@ -313,14 +317,27 @@ window.addEventListener("message", (e) => {
   if (!node) return;
 
   if (d.type === "ready") { pushNodeState(node); return; }
-  if (d.type === "state") { writeJson(node, "state", d.payload || {}); return; }
+  if (d.type === "state") {
+    writeJson(node, "state", d.payload || {});
+    if (node.h3Instant) { node.h3Status = summarizeInstant(d.payload); node.setDirtyCanvas(true, true); }
+    return;
+  }
   if (d.type === "close") { hideOverlay(); return; }
   if (d.type === "apply") {
     writeJson(node, "result", d.payload || {});
-    node.h3Status = summarize(d.payload);
+    // An Instant node regenerates on Queue; what was applied in the overlay
+    // is kept for the overlay's own sake but is not what the sockets carry.
+    if (!node.h3Instant) node.h3Status = summarize(d.payload);
     node.setDirtyCanvas(true, true);
   }
 });
+
+/** What the Instant node will ask for on the next Queue, from the saved form. */
+const summarizeInstant = (state) => {
+  const scene = String(state?.prompt || "").replace(/\s+/g, " ").trim();
+  if (!scene) return "⚡ Queue마다 생성 · 장면 없음 (열기 또는 scene_request 소켓)";
+  return `⚡ Queue마다 생성 · ${scene}`;
+};
 
 const summarize = (r) => {
   if (!r || !r.prompt) return "적용된 프롬프트 없음";
@@ -660,11 +677,13 @@ const openSettings = async (node) => {
 app.registerExtension({
   name: "h3.prompt.maker.ui",
   async beforeRegisterNodeDef(nodeType, nodeData) {
-    if (nodeData?.name !== NODE) return;
+    if (nodeData?.name !== NODE && nodeData?.name !== NODE_INSTANT) return;
+    const instant = nodeData.name === NODE_INSTANT;
 
     const onCreated = nodeType.prototype.onNodeCreated;
     nodeType.prototype.onNodeCreated = function () {
       const r = onCreated?.apply(this, arguments);
+      this.h3Instant = instant;
       for (const name of HIDDEN) {
         const w = widget(this, name);
         if (w) hideWidget(w);
@@ -676,7 +695,8 @@ app.registerExtension({
       padBelow(open, 8);
       this.addWidget("button", "⚙️ 모델 연결", null, () => openSettings(this));
 
-      this.h3Status = summarize(readJson(this, "result", {}));
+      this.h3Status = instant ? summarizeInstant(readJson(this, "state", {}))
+                              : summarize(readJson(this, "result", {}));
       this.h3Conn = describeConn(readJson(this, "llm", {}));
       resize(this);
       return r;
@@ -701,7 +721,8 @@ app.registerExtension({
       ctx.fillText(fitText(ctx, conn.text, room), 12, this.size[1] - FOOTER_H + 14);
 
       const status = this.h3Status || "적용된 프롬프트 없음";
-      ctx.fillStyle = status.startsWith("✓") ? "#34d399" : "#8b949e";
+      ctx.fillStyle = status.startsWith("✓") || status.startsWith("⚡ Queue마다 생성 · ") && !status.includes("장면 없음")
+        ? "#34d399" : "#8b949e";
       ctx.fillText(fitText(ctx, status, room), 12, this.size[1] - FOOTER_H + 31);
       ctx.restore();
     };
@@ -709,7 +730,9 @@ app.registerExtension({
     const onConfigure = nodeType.prototype.onConfigure;
     nodeType.prototype.onConfigure = function () {
       const r = onConfigure?.apply(this, arguments);
-      this.h3Status = summarize(readJson(this, "result", {}));
+      this.h3Instant = instant;
+      this.h3Status = instant ? summarizeInstant(readJson(this, "state", {}))
+                              : summarize(readJson(this, "result", {}));
       this.h3Conn = describeConn(readJson(this, "llm", {}));
       resize(this);
       return r;

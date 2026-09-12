@@ -49,6 +49,15 @@ ok('bridge: outbound messages name a concrete target origin, not "*"',
   /postMessage\(\s*\{[^}]*\},\s*window\.location\.origin\s*\)/s.test(src)
   && !/postMessage\([^)]*,\s*"\*"\s*\)/s.test(src));
 
+// --- the Instant node shares the extension ----------------------------------
+// One extension draws both nodes. If the registration check ever goes back to
+// a single name, the Instant node comes up as three bare text widgets and no
+// buttons — it works, but nobody can open the overlay to fill it in.
+ok('instant: the extension registers for the Instant node too',
+  /nodeData\?\.name !== NODE && nodeData\?\.name !== NODE_INSTANT/.test(src));
+ok('instant: its face describes the Queue behaviour, not an applied result',
+  /summarizeInstant/.test(src) && /Queue마다 생성/.test(src));
+
 // --- saved-settings migration -------------------------------------------------
 // readLlm rewrites every pre-optimization workflow on first open. It had no
 // test at all, and it is the one function here that mutates the user's file.
