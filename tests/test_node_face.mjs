@@ -58,6 +58,16 @@ ok('instant: the extension registers for the Instant node too',
 ok('instant: its face describes the Queue behaviour, not an applied result',
   /summarizeInstant/.test(src) && /Queue마다 생성/.test(src));
 
+// --- freeing ComfyUI's memory before generating ------------------------------
+// The dialog is the only place this can be turned off, and DEFAULT_LLM is what
+// every workflow saved before the feature existed inherits.
+ok('free: the default is to hand the ComfyUI VRAM to the LLM',
+  /free_vram:\s*"models"/.test(src));
+ok('free: the dialog offers it, labelled 생성 전', /row\("free_vram", "생성 전"/.test(src));
+ok('free: and saves the choice', /free_vram:\s*inputs\.free_vram\.value/.test(src));
+ok('free: it is hidden for Gemini, which has no local VRAM to reclaim',
+  /rows\.free_vram\.style\.display = isGemini \? "none" : "grid"/.test(src));
+
 // --- saved-settings migration -------------------------------------------------
 // readLlm rewrites every pre-optimization workflow on first open. It had no
 // test at all, and it is the one function here that mutates the user's file.

@@ -19,6 +19,7 @@ jobs:
       - run: python3 tests/test_parse.py
       - run: python3 tests/test_routes.py
       - run: python3 tests/test_instant_node.py
+      - run: python3 tests/test_comfy_memory.py
       - run: python3 tests/test_system_prompt.py
       - run: python3 tests/test_thinking.py
       - run: python3 tests/test_media_parts.py

@@ -19,12 +19,13 @@ import time
 import urllib.parse
 import traceback
 
+from .comfy_memory import DEFAULT_FREE_MODE, FREE_MODES, describe, free_comfy_memory
 from .h3_prompts import build_system_prompt, nearest_grid_frames
 from .llm_backends import (
     AUTO_MODEL, BACKEND_NAMES, LLMCancelled, LLMError, PRESET_BASE_URLS,
     PRESET_CLI_COMMANDS, StreamCancel, THINKING_MODES, UNLOAD_MODES, call_llm,
-    clamp_max_tokens, discover_local_models, normalize_backend, probe_backend,
-    resolve_backend, stream_llm, unload_model, warm_up_model,
+    clamp_max_tokens, discover_local_models, is_local_target, normalize_backend,
+    probe_backend, resolve_backend, stream_llm, unload_model, warm_up_model,
 )
 
 PREFIX = "/h3_prompt_maker"
@@ -179,6 +180,9 @@ def _llm_settings(body):
                          if str(llm.get("unload_after") or "close") in UNLOAD_MODES else "close"),
         "prompt_profile": (str(llm.get("prompt_profile") or "fast")
                            if str(llm.get("prompt_profile") or "fast") in PROMPT_PROFILES else "fast"),
+        "free_vram": (str(llm.get("free_vram") or DEFAULT_FREE_MODE)
+                      if str(llm.get("free_vram") or DEFAULT_FREE_MODE) in FREE_MODES
+                      else DEFAULT_FREE_MODE),
     }
 
 
@@ -229,6 +233,48 @@ def _selected_model(cfg):
 #: only costs a request — on llama.cpp it can also evict the prompt cache
 #: that made the previous prefill cheap.
 _ALWAYS_RESIDENT_BACKENDS = {"llamacpp", "vllm"}
+
+
+#: CLI runners that reach a cloud service. `custom_cli` is not on the list:
+#: it is whatever command the machine owner exported, which may well be a
+#: local llama.cpp wrapper that wants the VRAM.
+_CLOUD_CLI_BACKENDS = {"claude_cli", "gemini_cli", "codex_cli"}
+
+
+def wants_comfy_memory(cfg):
+    """True when this generation runs on THIS GPU, so freeing it helps.
+
+    A cloud endpoint gains nothing from evicting the local checkpoints — it
+    only costs the next render the time to load them again.
+    """
+    if cfg["free_vram"] == "off":
+        return False
+    backend = normalize_backend(cfg["backend"])
+    if backend in _CLOUD_CLI_BACKENDS:
+        return False
+    if backend.endswith("_cli"):
+        return True
+    try:
+        _kind, url, _model, _cmd = resolve_backend(backend, cfg["base_url"], "", "")
+    except Exception:  # noqa: BLE001 — the real call reports the useful error
+        return False
+    return is_local_target(url)
+
+
+async def _free_comfy_for_generation(cfg):
+    """Hand ComfyUI's VRAM to the LLM before asking it for anything.
+
+    Off the event loop: unload_all_models walks every loaded model and a
+    gc.collect over a freshly dropped checkpoint is not instant, and holding
+    ComfyUI's one loop there is what makes the websocket say "Reconnecting…".
+    """
+    if not wants_comfy_memory(cfg):
+        return {"ran": False, "busy": False, "detail": "", "freed_bytes": None}
+    result = await _offthread(free_comfy_memory, cfg["free_vram"])
+    line = describe(result)
+    if line:
+        print(f"[h3_prompt_maker] {line}", flush=True)
+    return result
 
 
 async def _warm_for_generation(cfg):
@@ -338,8 +384,19 @@ async def _stream_generation(request, cfg, system_prompt, user_text, send_images
     control = StreamCancel()
     future = None
     try:
-        await write_event({"type": "status", "stage": "loading", "message": "모델 준비 중…"})
+        freed = {"ran": False}
+        if wants_comfy_memory(cfg):
+            await write_event({"type": "status", "stage": "freeing",
+                               "message": "ComfyUI VRAM·캐시 비우는 중…"})
+            freed = await _free_comfy_for_generation(cfg)
+        await write_event({"type": "status", "stage": "loading",
+                           "message": "모델 준비 중…" if not freed.get("ran")
+                                      else f"{describe(freed)} · 모델 준비 중…"})
         warm_note, load_metrics = await _warm_for_generation(cfg)
+        if freed.get("ran"):
+            load_metrics = {**load_metrics,
+                            "comfy_freed_bytes": freed.get("freed_bytes"),
+                            "comfy_free_detail": freed.get("detail", "")}
         await write_event({
             "type": "status", "stage": "generating", "message": "프롬프트 생성 중…",
             "metrics": load_metrics,
@@ -479,6 +536,7 @@ def register(routes):
             "thinking_modes": THINKING_MODES,
             "unload_modes": UNLOAD_MODES,
             "prompt_profiles": PROMPT_PROFILES,
+            "free_vram_modes": FREE_MODES,
             "preset_base_urls": PRESET_BASE_URLS,
             "preset_cli_commands": PRESET_CLI_COMMANDS,
             "models": await _offthread(discover_local_models),
@@ -557,7 +615,12 @@ def register(routes):
                 request, cfg, system_prompt, user_text, send_images, audios, seconds)
 
         # JSON compatibility path for old overlay bundles and direct callers.
+        freed = await _free_comfy_for_generation(cfg)
         warm_note, load_metrics = await _warm_for_generation(cfg)
+        if freed.get("ran"):
+            load_metrics = {**load_metrics,
+                            "comfy_freed_bytes": freed.get("freed_bytes"),
+                            "comfy_free_detail": freed.get("detail", "")}
 
         try:
             text = await _offthread(

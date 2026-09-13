@@ -11,12 +11,15 @@ import io
 import json
 import re
 
+from .comfy_memory import describe as describe_free, free_comfy_memory
 from .h3_prompts import build_system_prompt, nearest_grid_frames
 from .llm_backends import (
     AUTO_MODEL, BACKEND_NAMES, LLMError, call_llm, discover_local_models, normalize_backend,
     warm_up_model,
 )
-from .server_routes import _ALWAYS_RESIDENT_BACKENDS, _selected_model, prepare_generation
+from .server_routes import (
+    _ALWAYS_RESIDENT_BACKENDS, _selected_model, prepare_generation, wants_comfy_memory,
+)
 
 SUBMODES = ["ref2va", "t2va", "i2va", "fl2va", "l2va"]
 DURATIONS = ["5s (124f)", "6s (158f)", "8s (192f)", "10s (243f)", "12s (294f)", "15s (362f)",
@@ -597,6 +600,13 @@ class H3PromptMakerInstant:
 
         prep = prepare_generation(instant_request_body(form, settings, scene, images_b64))
         cfg = prep["cfg"]
+        # Hand the card to the LLM first. This node runs inside the graph, so
+        # it is the running job — the node cache is left alone (wiping the
+        # cache of the graph currently executing only costs the next queue).
+        if wants_comfy_memory(cfg):
+            line = describe_free(free_comfy_memory(cfg["free_vram"], during_execution=True))
+            if line:
+                print(f"[h3_prompt_maker] {line}", flush=True)
         # "창 닫을 때 언로드" has no window to close here. The nearest honest
         # reading in a graph is "unload as soon as the prompt is out": the H3
         # render that follows in the same queue wants that VRAM back.

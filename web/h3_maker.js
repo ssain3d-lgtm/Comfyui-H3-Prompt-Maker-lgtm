@@ -50,6 +50,9 @@ const DEFAULT_LLM = {
   prompt_profile: "fast",
   //  close  stay resident for retries, then unload when this overlay closes
   unload_after: "close",
+  //  models  free ComfyUI's VRAM and node cache before generating (default)
+  //  cache   release the allocator's blocks only | off  leave ComfyUI alone
+  free_vram: "models",
   /** Epoch ms of the last successful 연결 확인, 0 when never checked. */
   verifiedAt: 0,
 };
@@ -472,6 +475,15 @@ const openSettings = async (node) => {
   inputs.thinking.value = cfg.thinking || "off";
   row("thinking", "thinking", inputs.thinking);
 
+  inputs.free_vram = el("select", FIELD_STYLE);
+  for (const [value, label] of [
+    ["models", "모델·캐시 비우기 — ComfyUI VRAM을 LLM에 넘김 (권장)"],
+    ["cache", "캐시만 비우기 — 올라간 모델은 유지"],
+    ["off", "끄기 — ComfyUI 메모리를 건드리지 않음"],
+  ]) inputs.free_vram.append(new Option(label, value));
+  inputs.free_vram.value = cfg.free_vram || "models";
+  row("free_vram", "생성 전", inputs.free_vram);
+
   inputs.unload_after = el("select", FIELD_STYLE);
   for (const [value, label] of [
     ["keep", "유지 — 다음 생성이 가장 빠름 (VRAM 점유)"],
@@ -490,6 +502,8 @@ const openSettings = async (node) => {
     textContent: "thinking: Qwen3 같은 추론 모델은 답하기 전에 max_tokens 예산을 생각하는 데 씁니다. "
                + "off로 두면 그 예산이 전부 답변으로 갑니다 (/no_think + 템플릿 스위치, 모르는 서버는 무시). "
                + "Fast 프롬프트는 출력 형식과 렌더 핵심 규칙만 보내 입력 처리를 줄입니다. "
+               + "생성 전: ComfyUI가 붙들고 있는 체크포인트와 노드 캐시를 먼저 비워 로컬 LLM에 VRAM을 넘깁니다 "
+               + "(렌더 직후 첫 생성이 느리거나 메모리 부족으로 실패하는 증상의 해법). 다음 렌더는 모델을 다시 올립니다. "
                + "생성 후 '창 닫을 때'는 재생성 동안 유지하고 적용/닫기 때 VRAM에서 내립니다. "
                + "Ollama는 keep_alive를 사용합니다. llama.cpp·vLLM은 프로세스가 곧 모델이라 해당 없음. "
                + "max_tokens: 너무 낮으면 본문 없이 한 줄만 돌아옵니다. 기본 60000.",
@@ -514,6 +528,9 @@ const openSettings = async (node) => {
     rows.server_model.style.display = isCli ? "none" : "grid";
     // A cloud API holds no VRAM here: there is nothing to pre-load or unload.
     rows.unload_after.style.display = isGemini ? "none" : "grid";
+    // Evicting the local checkpoints buys a cloud endpoint nothing — it only
+    // costs the next render the time to load them again.
+    rows.free_vram.style.display = isGemini ? "none" : "grid";
     loadBtn.style.display = isGemini ? "none" : "";
     unloadBtn.style.display = isGemini ? "none" : "";
     inputs.api_key.placeholder = isGemini
@@ -653,6 +670,7 @@ const openSettings = async (node) => {
       max_tokens: Number(inputs.max_tokens.value) || 60000,
       thinking: inputs.thinking.value,
       prompt_profile: inputs.prompt_profile.value,
+      free_vram: inputs.free_vram.value,
       unload_after: inputs.unload_after.value,
       // Recorded so the node face can distinguish a checked configuration from
       // one that was merely typed in and saved.
