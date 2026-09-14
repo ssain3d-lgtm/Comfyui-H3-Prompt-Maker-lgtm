@@ -156,7 +156,8 @@ UNLOAD_MODES = ["keep", "close", "5m", "now"]
 
 #: Idle seconds per mode. LM Studio uses ttl for JIT-loaded models and its native
 #: v1 endpoint for a guaranteed immediate unload; Ollama uses keep_alive on the
-#: inference request. llama.cpp and vLLM hold one model for the process lifetime.
+#: inference request. A llama-server router is unloaded by model name after the
+#: call; a single-model llama-server and vLLM hold one model for the process lifetime.
 _TTL_SECONDS = {"5m": 300, "now": 1}
 
 
@@ -442,6 +443,10 @@ def _unload_after_call(backend_name, base_url, api_key, model, unload_after, pay
         # v0.4's native endpoint unloads the actual loaded instance regardless
         # of how it entered memory, which is what "즉시 언로드" promises.
         result = _unload_lmstudio_model(base_url, api_key, model, min(timeout, 15.0))
+    elif backend == "llamacpp" and model:
+        # A llama-server router holds each model in a child process and has no
+        # per-request keep-alive field, so the explicit unload is the mechanism.
+        result = _unload_llamacpp_model(base_url, api_key, model, min(timeout, 15.0))
     elif shed:
         # Ollama has no post-generation native unload to fall back on: the
         # keep_alive on the request was the whole mechanism.
@@ -1109,6 +1114,37 @@ def _unload_lmstudio_model(openai_base_url, api_key, model, timeout):
             "detail": f"{len(instance_ids)}개 인스턴스 언로드됨"}
 
 
+def _server_root(openai_base_url):
+    """The server's own root for native (non-/v1) endpoints."""
+    parts = urllib.parse.urlsplit(openai_base_url)
+    path = parts.path.rstrip("/")
+    if path.endswith("/v1"):
+        path = path[:-3]
+    return urllib.parse.urlunsplit((parts.scheme, parts.netloc, path, "", ""))
+
+
+def _unload_llamacpp_model(openai_base_url, api_key, model, timeout):
+    """Stop the model's child process on a llama-server running in router mode.
+
+    Router mode (--models-preset / --models-dir) answers POST /models/unload
+    with 400 "model is not running" for a model it is not holding. A plain
+    single-model llama-server has no such route (404): that process really does
+    own its model, so it is reported as unsupported rather than as a failure.
+    """
+    endpoint = _server_root(openai_base_url) + "/models/unload"
+    try:
+        _post_json(endpoint, {"model": model}, api_key, timeout)
+    except LLMError as exc:
+        if "HTTP 404" in str(exc):
+            return {"ok": True, "supported": False,
+                    "detail": "단일 모델 llama-server 는 프로세스가 모델을 소유해서 언로드할 수 없습니다 "
+                              "(라우터 모드에서만 가능)."}
+        if "not running" in str(exc):
+            return {"ok": True, "supported": True, "detail": f"{model} 이미 언로드됨"}
+        return {"ok": False, "supported": True, "detail": f"llama.cpp 라우터 언로드 실패: {exc}"}
+    return {"ok": True, "supported": True, "detail": f"{model} 언로드됨"}
+
+
 def _lmstudio_chat_models(openai_base_url, api_key, timeout, fallback_ids):
     """Return metadata-filtered ids, falling back on older LM Studio builds."""
     for endpoint in _lmstudio_metadata_urls(openai_base_url):
@@ -1344,13 +1380,10 @@ def unload_model(backend, base_url, api_key, model, timeout=20.0):
     normalized = normalize_backend(backend)
     if normalized == "lmstudio":
         return _unload_lmstudio_model(url, key, model, timeout)
+    if normalized == "llamacpp":
+        return _unload_llamacpp_model(url, key, model, timeout)
     if normalized == "ollama":
-        parts = urllib.parse.urlsplit(url)
-        path = parts.path.rstrip("/")
-        if path.endswith("/v1"):
-            path = path[:-3]
-        endpoint = urllib.parse.urlunsplit(
-            (parts.scheme, parts.netloc, path + "/api/generate", "", ""))
+        endpoint = _server_root(url) + "/api/generate"
         try:
             _post_json(endpoint, {"model": model, "keep_alive": 0, "stream": False}, key, timeout)
             return {"ok": True, "supported": True, "detail": f"{model} 언로드됨"}

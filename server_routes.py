@@ -228,10 +228,10 @@ def _selected_model(cfg):
         return ""
 
 
-#: Servers whose process *is* the model: nothing this pack sends can unload
-#: them, so a model that answered once is still there and a pre-flight ping
-#: only costs a request — on llama.cpp it can also evict the prompt cache
-#: that made the previous prefill cheap.
+#: Servers that load the model themselves when a request names it, so a
+#: pre-flight ping only costs a request — on llama.cpp it can also evict the
+#: prompt cache that made the previous prefill cheap. (A llama-server router
+#: can still be unloaded after the call; a single-model one and vLLM cannot.)
 _ALWAYS_RESIDENT_BACKENDS = {"llamacpp", "vllm"}
 
 

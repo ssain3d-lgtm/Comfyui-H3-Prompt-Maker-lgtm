@@ -22,7 +22,7 @@ m = importlib.util.module_from_spec(sp); sys.modules["h3u"] = m; sp.loader.exec_
 L = importlib.import_module("h3u.llm_backends")
 
 MODEL = "qwen3.8-27b-uncensored"
-state = {"loaded": None, "jit": True}
+state = {"loaded": None, "jit": True, "router": True}
 # When set, the first chat request is refused for a reason that has nothing
 # to do with the keep-alive fields — which is exactly when the retry ladder
 # used to throw the unload instruction away along with everything else.
@@ -52,6 +52,20 @@ class Server(BaseHTTPRequestHandler):
 
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))))
+        if self.path == "/models/unload":
+            # llama-server in router mode: one child process per model, stopped
+            # by name. These are the replies a real router gives. A single-model
+            # llama-server has no such route and answers 404.
+            want = body.get("model")
+            log.append({"kind": "unload", "model": want})
+            if not state["router"]:
+                return self._send(404, {"error": {"code": 404, "message": "File Not Found",
+                                                  "type": "not_found_error"}})
+            if state["loaded"] != want:
+                return self._send(400, {"error": {"code": 400, "message": "model is not running",
+                                                  "type": "invalid_request_error"}})
+            state["loaded"] = None
+            return self._send(200, {"success": True})
         if self.path.endswith("/api/v1/models/load"):
             want = body.get("model")
             extra = sorted(k for k in body if k != "model")
@@ -332,9 +346,9 @@ out, seq = via_route("close")
 eq("route: close mode loads once and keeps the model for retries", seq, ["load", "gen"])
 eq("route: close mode remains resident before the UI closes", state["loaded"], MODEL)
 
-# llama.cpp and vLLM cannot be unloaded by anything this pack sends, so the
-# warm-up ping before each generation was a wasted request — and on llama.cpp
-# one that evicts the prompt cache the previous prefill left behind.
+# llama.cpp and vLLM load the model a request names, so the warm-up ping before
+# each generation was a wasted request — and on llama.cpp one that evicts the
+# prompt cache the previous prefill left behind.
 for resident in ("llamacpp", "vllm"):
     state["loaded"], state["jit"] = MODEL, True
     out, seq = via_route("close", backend=resident)
@@ -349,6 +363,45 @@ state["loaded"], state["jit"] = None, False
 out, seq = via_route("now")
 eq("route: JIT-off still uses explicit load and unload", seq, ["load", "gen", "unload"])
 ok("route: JIT-off generation succeeds", "subject_definitions" in out.get("result", ""), out)
+
+# --- llama.cpp router ----------------------------------------------------------
+# llama-server in router mode (--models-preset / --models-dir) runs each model in
+# its own child process and stops it on POST /models/unload. That is exactly the
+# VRAM the H3 render queued after the prompt needs, so "생성 후 언로드" has to
+# reach it. Only a plain single-model llama-server really owns its model.
+state["loaded"], state["jit"], state["router"] = MODEL, True, True
+generate("now", "llamacpp")
+eq("llamacpp: no LM Studio ttl is sent", log[0]["ttl"], None)
+eq("llamacpp: no Ollama keep_alive is sent", log[0]["keep_alive"], None)
+eq("llamacpp now: the router is told to unload after generation", [e["kind"] for e in log], ["gen", "unload"])
+eq("llamacpp now: the unload names the generated model", log[-1]["model"], MODEL)
+eq("llamacpp now: the model is actually gone afterwards", state["loaded"], None)
+
+state["loaded"] = MODEL
+generate("keep", "llamacpp")
+eq("llamacpp keep: nothing but the generation", [e["kind"] for e in log], ["gen"])
+eq("llamacpp keep: the model stays", state["loaded"], MODEL)
+
+unloaded = L.unload_model("llamacpp", URL, "", MODEL)
+eq("llamacpp close: explicit unload reports success", unloaded["ok"], True)
+eq("llamacpp close: explicit unload releases VRAM", state["loaded"], None)
+
+again = L.unload_model("llamacpp", URL, "", MODEL)
+eq("llamacpp: a model that is not running counts as already unloaded", again["ok"], True)
+
+state["loaded"] = MODEL
+out, seq = via_route("now", backend="llamacpp")
+eq("route: llamacpp + now generates, then unloads — still no warm-up", seq, ["gen", "unload"])
+eq("route: llamacpp + now leaves the VRAM free", state["loaded"], None)
+
+state["loaded"], state["router"] = MODEL, False
+single = L.unload_model("llamacpp", URL, "", MODEL)
+eq("single llama-server: reported as not unloadable rather than failed",
+   (single["ok"], single["supported"]), (True, False))
+eq("single llama-server: the model is untouched", state["loaded"], MODEL)
+out = generate("now", "llamacpp")
+ok("single llama-server + now: the generation still answers", "subject_definitions" in out, out[:60])
+state["router"] = True
 
 srv.shutdown()
 if fails:
