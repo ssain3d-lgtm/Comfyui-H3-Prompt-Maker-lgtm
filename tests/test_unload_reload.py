@@ -27,6 +27,9 @@ state = {"loaded": None, "jit": True}
 # to do with the keep-alive fields — which is exactly when the retry ladder
 # used to throw the unload instruction away along with everything else.
 reject_once = {"armed": False}
+# When set, the load endpoint refuses any body carrying fields it does not
+# know — an LM Studio build older than the load-options API.
+reject_load_options = {"armed": False}
 log = []
 
 
@@ -51,9 +54,19 @@ class Server(BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))))
         if self.path.endswith("/api/v1/models/load"):
             want = body.get("model")
-            log.append({"kind": "load", "model": want})
+            extra = sorted(k for k in body if k != "model")
+            log.append({"kind": "load", "model": want, "extra": extra,
+                        "flash_attention": body.get("flash_attention")})
+            if reject_load_options["armed"] and extra:
+                reject_load_options["armed"] = False
+                return self._send(400, {"error": {"message": "unrecognized field 'flash_attention'"}})
             state["loaded"] = want
-            return self._send(200, {"type": "llm", "instance_id": want, "status": "loaded"})
+            out = {"type": "llm", "instance_id": want, "status": "loaded"}
+            if body.get("echo_load_config"):
+                # A real server reports what it applied, which is not always
+                # what was asked: an MLX model ignores flash attention.
+                out["load_config"] = {"flash_attention": bool(body.get("flash_attention"))}
+            return self._send(200, out)
         if self.path.endswith("/api/generate"):
             # Ollama's own unload endpoint: keep_alive 0 evicts the model.
             log.append({"kind": "unload", "model": body.get("model")})
@@ -196,6 +209,43 @@ warm = L.warm_up_model("lmstudio", URL, "", MODEL)
 eq("warm: reports success", warm["ok"], True)
 eq("warm: the model is in memory before any real call", state["loaded"], MODEL)
 eq("warm: native load is used instead of a one-token inference", log[-1]["kind"], "load")
+
+# --- load options ------------------------------------------------------------
+# Flash attention is a cheaper attention kernel: less VRAM, faster generation,
+# identical output. It can only be chosen at load time, so it is only ever this
+# pack's to set when this pack is the one loading the model.
+loaded_call = log[-1]
+eq("load: flash attention is requested", loaded_call["flash_attention"], True)
+eq("load: and the server is asked to report back what it applied",
+   "echo_load_config" in loaded_call["extra"], True)
+ok("load: context_length is NOT pinned from here — a window smaller than "
+   "max_tokens would truncate an answer mid-prompt",
+   "context_length" not in loaded_call["extra"], str(loaded_call["extra"]))
+ok("load: eval_batch_size is not set either — it speeds up reading, "
+   "and reading is already the fast part",
+   "eval_batch_size" not in loaded_call["extra"], str(loaded_call["extra"]))
+ok("load: the applied state is reported to the user",
+   "flash attention 켜짐" in warm["detail"], warm["detail"])
+
+# An old build that refuses the extra fields must still get the model loaded.
+# Losing the option is a slower generation; losing the model is a failed one.
+state["loaded"], reject_load_options["armed"] = None, True
+log.clear()
+warm_old = L.warm_up_model("lmstudio", URL, "", MODEL)
+eq("old build: the load still succeeds", warm_old["ok"], True)
+eq("old build: the model really is in memory", state["loaded"], MODEL)
+eq("old build: it was retried without the options, not given up on",
+   [e["extra"] != [] for e in log if e["kind"] == "load"], [True, False])
+ok("old build: and the user is told the option did not take",
+   "지원하지 않는 빌드" in warm_old["detail"], warm_old["detail"])
+
+# A model somebody already loaded by hand carries LM Studio's own settings,
+# not ours — claiming flash attention there would be a lie.
+state["loaded"] = MODEL
+warm_resident = L.warm_up_model("lmstudio", URL, "", MODEL)
+eq("already resident: reported as success", warm_resident["ok"], True)
+ok("already resident: and says the load options were not ours to choose",
+   "LM Studio 설정" in warm_resident["detail"], warm_resident["detail"])
 
 # --- through the route, which is what actually runs ------------------------
 # The library doing the right thing is not the same as the route calling it.

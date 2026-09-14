@@ -1018,6 +1018,35 @@ def _lmstudio_matching_rows(rows, model):
     return matches
 
 
+#: Load options asked of LM Studio when THIS pack is the one loading the model.
+#:
+#: flash_attention is the only one set on purpose. It is a cheaper attention
+#: kernel, so it lowers VRAM use and lifts generation speed, and it changes no
+#: output — it only affects LM Studio's llama.cpp engine (MLX ignores it).
+#:
+#: context_length is deliberately absent. The window has to hold the input AND
+#: everything the model writes, and max_tokens here is 60000; pinning a smaller
+#: window from this side would truncate an answer mid-prompt, which is the one
+#: failure this app cannot recover from. Whatever the user configured in LM
+#: Studio stays in force.
+#:
+#: eval_batch_size is absent for a different reason: it speeds up reading the
+#: input, and reading is already the fast part (a second or two against twenty
+#: or more spent writing). It costs VRAM per batch for no visible gain.
+_LMSTUDIO_LOAD_OPTIONS = {"flash_attention": True}
+
+
+def _flash_attention_state(data):
+    """What the server says it actually applied, when it echoes its config."""
+    config = data.get("load_config") if isinstance(data, dict) else None
+    value = config.get("flash_attention") if isinstance(config, dict) else None
+    if value is True:
+        return "flash attention 켜짐"
+    if value is False:
+        return "flash attention 꺼짐(엔진 미지원)"
+    return ""
+
+
 def _load_lmstudio_model(openai_base_url, api_key, model, timeout):
     """Load through LM Studio's native v1 API; report unsupported for old builds."""
     rows = _lmstudio_native_models(openai_base_url, api_key, timeout)
@@ -1025,15 +1054,32 @@ def _load_lmstudio_model(openai_base_url, api_key, model, timeout):
         return {"ok": False, "supported": False, "detail": "native v1 model API unavailable"}
     matches = _lmstudio_matching_rows(rows, model)
     if matches and any(row.get("loaded_instances") for row in matches):
-        return {"ok": True, "supported": True, "detail": f"{model} 이미 메모리에 로드됨"}
+        # Already resident, so this pack never got to choose how it was loaded.
+        # Say so: flash attention is then whatever LM Studio's own load screen
+        # was set to, and only a reload would change it.
+        return {"ok": True, "supported": True,
+                "detail": f"{model} 이미 메모리에 로드됨 (로드 옵션은 LM Studio 설정을 따릅니다)"}
     endpoint = _lmstudio_metadata_urls(openai_base_url)[0] + "/load"
+    body = {"model": model, "echo_load_config": True, **_LMSTUDIO_LOAD_OPTIONS}
+    note = ""
     try:
-        data = _post_json(endpoint, {"model": model}, api_key, timeout)
-    except Exception as exc:
-        return {"ok": False, "supported": True, "detail": f"LM Studio native load failed: {exc}"}
+        data = _post_json(endpoint, body, api_key, timeout)
+    except Exception:
+        # A build that does not know these fields must not cost the user the
+        # model itself. Load it plainly and say the option did not take.
+        try:
+            data = _post_json(endpoint, {"model": model}, api_key, timeout)
+        except Exception as exc:
+            return {"ok": False, "supported": True, "detail": f"LM Studio native load failed: {exc}"}
+        note = "flash attention 옵션을 지원하지 않는 빌드"
     instance = data.get("instance_id") if isinstance(data, dict) else None
-    return {"ok": True, "supported": True,
-            "detail": f"{model} 메모리에 로드됨" + (f" ({instance})" if instance else "")}
+    note = note or _flash_attention_state(data)
+    detail = f"{model} 메모리에 로드됨"
+    if instance:
+        detail += f" ({instance})"
+    if note:
+        detail += f" — {note}"
+    return {"ok": True, "supported": True, "detail": detail}
 
 
 def _unload_lmstudio_model(openai_base_url, api_key, model, timeout):
