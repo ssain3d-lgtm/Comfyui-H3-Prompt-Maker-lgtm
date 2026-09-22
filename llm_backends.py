@@ -194,11 +194,19 @@ DEFAULT_THINKING = "off"
 #: why this is the portable half of the switch.
 _THINK_TOKENS = {"off": "/no_think", "on": "/think"}
 
+#: Backends that must not receive the text token. "Ignores what it does not know"
+#: is the assumption the token rides on, and NInfer breaks it: measured on
+#: ninfer-serve (Qwen3.8-27B NVFP4, 2026-09), "/no_think" left thinking ON and
+#: made the reasoning *longer* — 51 → 144 characters on "What is 2+2?" — because
+#: the model reads the line as part of the request. Its chat_template_kwargs
+#: switch works in both directions, so the token is pure prompt pollution here.
+_NO_THINK_TOKEN_BACKENDS = {"ninfer"}
 
-def apply_thinking(user_text, mode):
+
+def apply_thinking(user_text, mode, backend=""):
     """Append the control token for `mode`. Returns the text unchanged for auto."""
     token = _THINK_TOKENS.get(mode)
-    if not token:
+    if not token or normalize_backend(backend) in _NO_THINK_TOKEN_BACKENDS:
         return user_text
     return f"{user_text}\n\n{token}"
 
@@ -293,7 +301,7 @@ def _chat_payload(base_url, model, system_prompt, user_text, images_base64,
                   unload_after, backend_name, stream=False):
     """Build one OpenAI-compatible request and return its controlled user text."""
     gemini = is_gemini_target(base_url)
-    controlled_text = user_text if gemini else apply_thinking(user_text, thinking)
+    controlled_text = user_text if gemini else apply_thinking(user_text, thinking, backend_name)
 
     if images_base64 or audios_base64:
         content = [{"type": "text", "text": controlled_text}]
@@ -431,6 +439,19 @@ def _unload_after_call(backend_name, base_url, api_key, model, unload_after, pay
     # accepted, the server never received the unload instruction at all.
     wanted = unload_payload(unload_after, backend)
     shed = bool(wanted) and any(key not in payload for key in wanted)
+    # "keep" asks for nothing, and "close" is the overlay's own later action, so
+    # neither has anything to do — or to explain — at the end of a generation.
+    if unload_after in ("keep", "close"):
+        return
+    if backend == "ninfer":
+        # NInfer fixes GPU residency when the process starts: no keep-alive field,
+        # no unload route, no idle unload. Doing nothing here is correct — saying
+        # nothing is not, because the widget promised "생성 후 언로드".
+        print("H3 Prompt Maker: NInfer holds the model for the life of its process — "
+              "there is no unload API and no idle unload, so "
+              f"'{unload_after}' could not be applied. Stop the ninfer-serve process "
+              "to free the VRAM.", file=sys.stderr)
+        return
     if unload_after != "now":
         if shed:
             print(f"H3 Prompt Maker: {backend} rejected the keep-alive field, so "
@@ -745,6 +766,7 @@ LOCAL_PRESET_BASE_URLS = {
     "ollama": "http://127.0.0.1:11434/v1",
     "llamacpp": "http://127.0.0.1:8080/v1",
     "vllm": "http://127.0.0.1:8000/v1",
+    "ninfer": "http://127.0.0.1:8081/v1",
 }
 PRESET_BASE_URLS = {**LOCAL_PRESET_BASE_URLS, "gemini": GEMINI_BASE_URL}
 PRESET_CLI_COMMANDS = {
@@ -752,7 +774,9 @@ PRESET_CLI_COMMANDS = {
     "gemini_cli": "gemini -p",
     "codex_cli": "codex exec",
 }
-HTTP_BACKENDS = ["lmstudio", "ollama", "llamacpp", "vllm", "gemini", "openai_compat"]
+# ninfer is appended, never inserted: a saved workflow stores the combo's value,
+# and keeping the earlier names where they were costs nothing.
+HTTP_BACKENDS = ["lmstudio", "ollama", "llamacpp", "vllm", "gemini", "openai_compat", "ninfer"]
 CLI_BACKEND_LIST = ["claude_cli", "gemini_cli", "codex_cli", "custom_cli"]
 BACKEND_NAMES = HTTP_BACKENDS + CLI_BACKEND_LIST
 
@@ -1168,7 +1192,7 @@ def discover_local_models(timeout=0.8):
     """Model ids from LLM servers running on THIS machine.
 
     Loopback standard ports only (LM Studio 1234 / Ollama 11434 /
-    llama.cpp 8080 / vLLM 8000): closed local ports refuse instantly so
+    llama.cpp 8080 / vLLM 8000 / NInfer 8081): closed local ports refuse instantly so
     probing is effectively free, while probing remote hosts would stall
     every page load. Results are cached for a short TTL. Failures are
     silent — most users run only one (or none) of these servers.
@@ -1382,6 +1406,11 @@ def unload_model(backend, base_url, api_key, model, timeout=20.0):
         return _unload_lmstudio_model(url, key, model, timeout)
     if normalized == "llamacpp":
         return _unload_llamacpp_model(url, key, model, timeout)
+    if normalized == "ninfer":
+        return {"ok": False, "supported": False,
+                "detail": "NInfer 는 프로세스가 사는 동안 모델을 VRAM 에 상주시킵니다 "
+                          "(언로드 API 도, 유휴 언로드도 없습니다). 비우려면 ninfer-serve 를 중지하세요 "
+                          "— NInfer 설정 UI 의 중지 버튼."}
     if normalized == "ollama":
         endpoint = _server_root(url) + "/api/generate"
         try:

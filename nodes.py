@@ -234,8 +234,10 @@ def _build_user_content(scene_request, dialogue, voice_direction, submode,
 _BACKEND_INPUTS = {
     "backend": (BACKEND_NAMES, {
         "default": "lmstudio",
-        "tooltip": "lmstudio/ollama/llamacpp/vllm = local OpenAI-compatible servers on their "
-                   "standard ports (1234/11434/8080/8000) — nothing else to type. "
+        "tooltip": "lmstudio/ollama/llamacpp/vllm/ninfer = local OpenAI-compatible servers on "
+                   "their standard ports (1234/11434/8080/8000/8081) — nothing else to type. "
+                   "ninfer = NInfer (ninfer-serve); it keeps the model resident for the life of "
+                   "its process, so 'unload after' cannot free its VRAM. "
                    "gemini = Google Gemini API (needs a GEMINI_API_KEY; an empty model means "
                    "the newest stable Flash from Google's live list — the web app's models). "
                    "openai_compat = any other OpenAI-compatible address (OpenRouter, "

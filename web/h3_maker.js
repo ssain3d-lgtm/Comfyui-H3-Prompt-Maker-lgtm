@@ -23,6 +23,7 @@ const DEFAULT_PRESETS = {
     ollama: "http://127.0.0.1:11434/v1",
     llamacpp: "http://127.0.0.1:8080/v1",
     vllm: "http://127.0.0.1:8000/v1",
+    ninfer: "http://127.0.0.1:8081/v1",
     gemini: "https://generativelanguage.googleapis.com/v1beta/openai",
   },
   cli: {
