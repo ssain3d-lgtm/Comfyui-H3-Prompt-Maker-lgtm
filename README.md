@@ -282,6 +282,7 @@ SFW/NSFW · 참조 이미지(IMAGE, 최대 9장 — `<Picture N>` 라벨 자동 
 | `ollama` | `http://127.0.0.1:11434/v1` | |
 | `llamacpp` | `http://127.0.0.1:8080/v1` | `llama-server` 기준. 라우터 모드(`--models-preset`)면 생성 후 언로드 지원. `llama-cli` 단발 실행은 매번 모델을 리로드하므로 비추천 |
 | `vllm` | `http://127.0.0.1:8000/v1` | |
+| `ninfer` | `http://127.0.0.1:8081/v1` | [NInfer](https://github.com/Neroued/ninfer)(`ninfer-serve`). 아래 주의사항 참고 |
 
 - **`server_model` 드롭다운**: 위 표준 포트에 떠 있는 서버들의 모델 목록을 자동 조회합니다
   (내 컴퓨터 loopback만 조회 — 원격/유료 주소는 건드리지 않음). `(auto)` = `model` 칸의 값 사용.
@@ -291,6 +292,18 @@ SFW/NSFW · 참조 이미지(IMAGE, 최대 9장 — `<Picture N>` 라벨 자동 
 - 권장 로컬 모델: **Qwen3 14B 이상 인스트럭트** — 형식 준수가 빡빡해서 8B 이하는 자주 깨집니다.
 - `api_key`를 비워 두면 환경변수(`OPENAI_API_KEY` / `OPENROUTER_API_KEY` / `GEMINI_API_KEY` / `H3_LLM_API_KEY`)를 사용합니다.
   **위젯에 직접 입력한 키는 워크플로우 JSON과 그 워크플로우로 만든 모든 PNG 메타데이터에 저장되므로**, 공유할 계획이면 환경변수를 쓰세요.
+
+#### `ninfer` 주의사항 (실기기 확인: Qwen3.8-27B NVFP4 / RTX 5090, 2026-09)
+
+- **언로드가 없습니다.** NInfer 는 GPU 상주를 프로세스 시작 때 고정하고 언로드 API 도, 유휴 언로드도 두지 않습니다.
+  그래서 `unload_after`("생성 후 언로드")가 VRAM 을 비우지 못합니다 — 노드는 아무 일도 안 한 척하지 않고 콘솔에 이유를 적습니다.
+  비우려면 `ninfer-serve` 프로세스를 중지하세요.
+- **thinking 은 템플릿 스위치로만 끕니다.** 다른 백엔드에는 `/no_think` 문장도 같이 보내는데, NInfer 에서는 그게 **안 먹힙니다**:
+  모델이 프롬프트의 일부로 읽어서 추론이 오히려 길어졌습니다("What is 2+2?" 기준 51자 → 144자). 그래서 ninfer 에서는
+  이 문장을 보내지 않고 `chat_template_kwargs` 만 씁니다(양방향 모두 동작 확인).
+- **모델 이름은 서버가 광고하는 ID 와 같아야 합니다.** 다른 이름은 400 입니다 — `server_model` 드롭다운에서 고르면 맞습니다.
+- 이미지·비디오는 서버를 `--vision` 으로 띄웠을 때만 됩니다. 오디오는 지원하지 않고, 노드가 자동으로 떼어낸 뒤 다시 보냅니다.
+- `max_tokens` 는 얼마를 주든 받아들이고 내부에서 자릅니다(1,000,000 까지 확인). 이 백엔드만의 별도 상한은 두지 않았습니다.
 
 ### `gemini` — Google Gemini API (프리셋, 웹앱이 쓰던 구글 모델)
 
@@ -430,6 +443,7 @@ python3 tests/test_fast_profile.py   # Fast 계약 유지와 Full 대비 크기
 python3 tests/test_event_loop.py     # 느린 생성 중 ComfyUI 이벤트 루프 응답성(aiohttp 필요)
 python3 tests/test_model_filtering.py # 채팅 모델만 목록에 남기는 필터
 python3 tests/test_gemini_backend.py  # gemini 프리셋의 주소·키·모델 선택
+python3 tests/test_ninfer.py          # ninfer 프리셋 — 텍스트 토큰 금지, 언로드 없음을 사실대로 말하는지
 python3 tests/test_untrusted_input.py # 요청 본문이 파일 시스템·명령줄에 닿지 않는지
 node   tests/test_node_face.mjs       # 노드 표면, 호스트 브리지 경계, 저장 설정 마이그레이션
 python3 tools/check_bundle.py   # 커밋된 번들이 서빙 가능하고 외부 참조가 없는지
